@@ -16,6 +16,7 @@ Normalizers disponibles en app/services/ingesta_normalizers.py.
 from __future__ import annotations
 
 import base64
+import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,6 +34,7 @@ from app.models.proceso import Proceso
 from app.schemas.ingesta import (
     CorreoCorreccionIn,
     CorreoIngestaIn,
+    CorreoPropuestaIn,
     IngestaCorreoResultOut,
 )
 from app.services.archivos_service import (
@@ -79,6 +81,11 @@ def _get_safe_ext_ingesta(content_type: str) -> str:
         "image/gif": ".gif",
         "image/tiff": ".tif",
         "image/webp": ".webp",
+        "application/zip": ".zip",
+        "application/x-zip-compressed": ".zip",
+        "application/vnd.rar": ".rar",
+        "application/x-rar-compressed": ".rar",
+        "application/x-7z-compressed": ".7z",
     }
     ext = ALLOWED_CONTENT_TYPES.get(content_type) or extra_map.get(content_type)
     if ext is None:
@@ -187,6 +194,12 @@ def ingestar_correo(db: Session, payload: CorreoIngestaIn) -> IngestaCorreoResul
         tipo=payload.tipo,
         fecha_documento=payload.fecha_documento,
         fecha_recepcion=payload.fecha_recepcion,
+        relevancia_score=payload.relevancia_score,
+        relevancia_motivos=payload.relevancia_motivos,
+        proceso_sugerido_id=payload.proceso_sugerido_id,
+        etapa_sugerida=payload.etapa_sugerida,
+        fase_sugerida=payload.fase_sugerida,
+        resumen_sugerido=payload.resumen_sugerido,
         estado_revision="PENDIENTE",
     )
 
@@ -394,6 +407,13 @@ def aprobar_correo(
     ingesta_id: int,
     proceso_id: int,
     usuario: str,
+    etapa_sugerida: str | None = None,
+    estado_etapa: str = "COMPLETADO",
+    fecha_documento=None,
+    fecha_fin=None,
+    responsable: str | None = None,
+    oficio_correo: str | None = None,
+    observaciones: str | None = None,
 ) -> IngestaCorreo:
     """Vincula manualmente un correo PENDIENTE a un proceso.
 
@@ -426,6 +446,21 @@ def aprobar_correo(
     doc_rows = db.execute(
         select(IngestaDocumento).where(IngestaDocumento.ingesta_correo_id == ingesta_id)
     ).scalars().all()
+
+    if etapa_sugerida:
+        correo.etapa_sugerida = etapa_sugerida
+    if fecha_documento:
+        correo.fecha_documento = fecha_documento
+    if oficio_correo:
+        correo.numero_oficio = oficio_correo
+
+    # Valores confirmados en la UI para poblar el registro de etapa inferido.
+    # No requieren columnas nuevas: viven solo durante esta transacción.
+    correo.estado_etapa_sugerido = estado_etapa
+    correo.fecha_fin_sugerida = fecha_fin
+    correo.responsable_sugerido = responsable
+    correo.oficio_correo_sugerido = oficio_correo
+    correo.observaciones_sugeridas = observaciones
 
     _vincular(
         db=db,
@@ -475,6 +510,39 @@ def rechazar_correo(
     correo.motivo_rechazo = motivo
     correo.revisado_por = usuario
     correo.revisado_en = now
+
+    db.commit()
+    db.refresh(correo)
+    return correo
+
+
+# ---------------------------------------------------------------------------
+# Public: restaurar_correo
+# ---------------------------------------------------------------------------
+
+def restaurar_correo(
+    db: Session,
+    ingesta_id: int,
+    usuario: str,
+) -> IngestaCorreo:
+    """Restaura un correo RECHAZADO a PENDIENTE para nueva revisión."""
+    correo = db.get(IngestaCorreo, ingesta_id)
+    if correo is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Correo de ingesta {ingesta_id} no encontrado.",
+        )
+
+    if correo.estado_revision != "RECHAZADO":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Solo se pueden restaurar correos RECHAZADO. Estado actual: '{correo.estado_revision}'.",
+        )
+
+    correo.estado_revision = "PENDIENTE"
+    correo.motivo_rechazo = None
+    correo.revisado_por = usuario
+    correo.revisado_en = datetime.now(timezone.utc).replace(tzinfo=None)
 
     db.commit()
     db.refresh(correo)
@@ -663,6 +731,119 @@ def corregir_correo(
 
 
 # ---------------------------------------------------------------------------
+# Public: get_correo / guardar_propuesta_correo
+# ---------------------------------------------------------------------------
+
+def get_correo(db: Session, ingesta_id: int) -> IngestaCorreo:
+    """Retorna un correo de ingesta por id o 404."""
+    correo = db.get(IngestaCorreo, ingesta_id)
+    if correo is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Correo de ingesta {ingesta_id} no encontrado.",
+        )
+    return correo
+
+
+def _resolver_proceso_sugerido(db: Session, data: dict) -> int | None:
+    """Resuelve un proceso sugerido por id interno o codigo visible YYYY-NNN."""
+    proceso_id = data.get("proceso_sugerido_id")
+    if proceso_id is not None:
+        proceso = db.get(Proceso, proceso_id)
+        if proceso is None or proceso.eliminado_en is not None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Proceso sugerido {proceso_id} no encontrado o fue eliminado.",
+            )
+        return int(proceso_id)
+
+    haystack = " ".join(
+        str(data.get(campo) or "")
+        for campo in (
+            "proceso_sugerido_codigo",
+            "resumen_sugerido",
+            "relevancia_motivos",
+        )
+    )
+    match = re.search(r"\b20\d{2}-\d{3,4}\b", haystack)
+    if not match:
+        return None
+
+    codigo = match.group(0)
+    proceso = db.execute(
+        select(Proceso).where(
+            Proceso.id_proceso == codigo,
+            Proceso.eliminado_en.is_(None),
+        )
+    ).scalar_one_or_none()
+    return proceso.id if proceso is not None else None
+
+
+def guardar_propuesta_correo(
+    db: Session,
+    ingesta_id: int,
+    propuesta: CorreoPropuestaIn,
+    usuario: str,
+) -> IngestaCorreo:
+    """Guarda una propuesta de clasificacion sin aprobar el correo.
+
+    Pensado para Claude/MCP: puede sugerir proceso, etapa, resumen y oficio,
+    pero la vinculacion final sigue pasando por el modal de aprobacion.
+    """
+    correo = get_correo(db, ingesta_id)
+    if correo.estado_revision != "PENDIENTE":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Solo se pueden guardar propuestas en correos PENDIENTE. "
+                f"Estado actual: '{correo.estado_revision}'."
+            ),
+        )
+
+    data = propuesta.model_dump(exclude_unset=True)
+
+    proceso_id = _resolver_proceso_sugerido(db, data)
+    if proceso_id is not None:
+        data["proceso_sugerido_id"] = proceso_id
+    elif data.get("relevancia_score") is not None and data["relevancia_score"] > 0.75:
+        data["relevancia_score"] = 0.75
+
+    if "relevancia_motivos" in data:
+        motivos = data.get("relevancia_motivos")
+        if motivos and not str(motivos).startswith("[CLAUDE]"):
+            data["relevancia_motivos"] = f"[CLAUDE] {motivos}"
+
+    for campo in (
+        "proceso_sugerido_id",
+        "etapa_sugerida",
+        "fase_sugerida",
+        "resumen_sugerido",
+        "relevancia_motivos",
+        "relevancia_score",
+        "fecha_documento",
+    ):
+        if campo in data:
+            setattr(correo, campo, data[campo])
+
+    if "numero_oficio" in data:
+        valor = data["numero_oficio"]
+        correo.numero_oficio = normalizar_oficio(valor) if valor else None
+
+    audit = HistorialCambio(
+        proceso_id=proceso_id,
+        campo_modificado="ingesta_propuesta",
+        valor_anterior=None,
+        valor_nuevo=f"ingesta_id={ingesta_id} propuesta por {usuario}",
+        modificado_por=usuario,
+    )
+    db.add(audit)
+
+    db.commit()
+    db.refresh(correo)
+    return correo
+
+
+# ---------------------------------------------------------------------------
 # Public: get_documentos_proceso
 # ---------------------------------------------------------------------------
 
@@ -674,3 +855,22 @@ def get_documentos_proceso(db: Session, proceso_id: int) -> list[IngestaDocument
         .order_by(IngestaDocumento.id)
     ).scalars().all()
     return list(docs)
+
+
+def get_correos_etapa(
+    db: Session,
+    proceso_id: int,
+    codigo_etapa: str,
+) -> list[IngestaCorreo]:
+    """Retorna correos aprobados vinculados a una etapa del proceso."""
+    codigo = codigo_etapa.strip()
+    correos = db.execute(
+        select(IngestaCorreo)
+        .where(
+            IngestaCorreo.proceso_id == proceso_id,
+            IngestaCorreo.etapa_sugerida == codigo,
+            IngestaCorreo.estado_revision.in_(["APROBADO", "APROBADO_AUTO"]),
+        )
+        .order_by(IngestaCorreo.revisado_en.desc().nullslast(), IngestaCorreo.creado_en.desc())
+    ).scalars().all()
+    return list(correos)

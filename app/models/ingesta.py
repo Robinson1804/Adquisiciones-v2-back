@@ -46,6 +46,7 @@ class IngestaCorreo(Base):
         Index("uq_ingesta_entry_id", "entry_id", unique=True),
         Index("idx_ingesta_estado_revision", "estado_revision"),
         Index("idx_ingesta_proceso_id", "proceso_id"),
+        Index("idx_ingesta_proceso_sugerido_id", "proceso_sugerido_id"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -92,6 +93,18 @@ class IngestaCorreo(Base):
     motivo_rechazo: Mapped[str | None] = mapped_column(Text)
     revisado_por: Mapped[str | None] = mapped_column(String(100))   # username o "INGESTA_AUTO"
     revisado_en: Mapped[datetime | None] = mapped_column(TIMESTAMP)
+
+    # Sugerencia de clasificación/revisión (Exchange/MCP/Claude).
+    relevancia_score: Mapped[float | None] = mapped_column(Numeric(4, 3))
+    relevancia_motivos: Mapped[str | None] = mapped_column(Text)
+    proceso_sugerido_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("procesos.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    etapa_sugerida: Mapped[str | None] = mapped_column(String(10))
+    fase_sugerida: Mapped[str | None] = mapped_column(String(80))
+    resumen_sugerido: Mapped[str | None] = mapped_column(Text)
 
     creado_en: Mapped[datetime] = mapped_column(
         TIMESTAMP, server_default=func.now(), nullable=False

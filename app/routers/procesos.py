@@ -286,6 +286,28 @@ def get_montos_proceso(
 
 
 # ---------------------------------------------------------------------------
+# GET /procesos/{id}/tiempos — lead-time / cuello de botella
+# ---------------------------------------------------------------------------
+
+@router.get("/{proceso_id}/tiempos", response_model=TiemposProcesoOut)
+def get_tiempos_proceso(
+    proceso_id: int,
+    db: Session = Depends(get_db),
+    _user: Usuario = Depends(get_current_user),
+) -> TiemposProcesoOut:
+    """Return interval chain, total days, area totals and bottleneck."""
+    from app.services.etapas_service import agrupar_etapas
+    from app.services.tiempos_service import calcular_tiempos
+
+    _get_active_proceso_or_404(db, proceso_id)
+    rows = db.execute(
+        select(EtapaRegistro).where(EtapaRegistro.proceso_id == proceso_id)
+    ).scalars().all()
+
+    return calcular_tiempos(agrupar_etapas(list(rows)))
+
+
+# ---------------------------------------------------------------------------
 # PUT /procesos/{id} — update (ADMIN or EDITOR)
 # ---------------------------------------------------------------------------
 
@@ -341,35 +363,6 @@ def delete_proceso(
     proceso.eliminado_en = datetime.now(timezone.utc).replace(tzinfo=None)
     db.commit()
     return {"message": "Proceso eliminado", "id": proceso_id}
-
-
-# ---------------------------------------------------------------------------
-# GET /procesos/{id}/tiempos — lead-time / cuello de botella (control-tiempos)
-# ---------------------------------------------------------------------------
-
-@router.get("/{proceso_id}/tiempos", response_model=TiemposProcesoOut)
-def get_tiempos_proceso(
-    proceso_id: int,
-    db: Session = Depends(get_db),
-    _user: Usuario = Depends(get_current_user),
-) -> TiemposProcesoOut:
-    """Return interval chain, total days, per-area breakdown and bottleneck.
-
-    Walks CADENA (26 non-bucle milestones) and computes consecutive intervals
-    between dated stages.  Returns empty sets when fewer than 2 milestones are
-    dated.  Auth: any authenticated role (read-only).
-    """
-    from app.services.etapas_service import agrupar_etapas
-    from app.services.tiempos_service import calcular_tiempos
-
-    _get_active_proceso_or_404(db, proceso_id)
-
-    rows = db.execute(
-        select(EtapaRegistro).where(EtapaRegistro.proceso_id == proceso_id)
-    ).scalars().all()
-
-    agrupadas = agrupar_etapas(list(rows))
-    return calcular_tiempos(agrupadas)
 
 
 # ---------------------------------------------------------------------------

@@ -213,11 +213,11 @@ class EtapasResponseOut(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Output schemas — control-tiempos (GET /procesos/{id}/tiempos)
+# Output schemas — timing analysis (GET /procesos/{id}/tiempos)
 # ---------------------------------------------------------------------------
 
 class IntervaloOut(BaseModel):
-    """One interval between two consecutive dated milestones in the CADENA."""
+    """One interval between two consecutive dated milestones."""
     cod: str
     nombre: str
     area_responsable: str
@@ -227,13 +227,13 @@ class IntervaloOut(BaseModel):
 
 
 class AreaTiempoOut(BaseModel):
-    """Aggregated days per area across all intervals."""
+    """Aggregated days per responsible area."""
     area: str
     dias_total: int
 
 
 class CuelloBotellaOut(BaseModel):
-    """The interval with the highest dias count (earliest wins on tie)."""
+    """The interval with the highest day count."""
     cod: str
     dias: int
 

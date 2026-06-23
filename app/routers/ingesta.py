@@ -32,16 +32,66 @@ from app.schemas.ingesta import (
     CorreoCorreccionIn,
     CorreoIngestaIn,
     CorreoIngestaOut,
+    CorreoPropuestaIn,
     DocumentoIngestaOut,
+    ExchangeCredencialesIn,
+    ExchangeFoldersOut,
+    ExchangeSyncIn,
+    ExchangeSyncOut,
+    ExchangeTestOut,
     IngestaCorreoResultOut,
     IngestaPendientesOut,
     RechazarIn,
 )
+from app.services import exchange_sync_service
 from app.services import ingesta_service as svc
 from app.services.archivos_service import assert_within_upload_dir
 from app.config import settings
 
 router = APIRouter(tags=["ingesta"])
+
+
+# ---------------------------------------------------------------------------
+# POST /ingesta/exchange/probar — credenciales temporales (ADMIN/EDITOR)
+# ---------------------------------------------------------------------------
+
+@router.post("/ingesta/exchange/probar", response_model=ExchangeTestOut)
+def probar_exchange(
+    body: ExchangeCredencialesIn,
+    _user: Usuario = Depends(require_role("ADMIN", "EDITOR")),
+) -> ExchangeTestOut:
+    """Prueba conexión Exchange/EWS sin guardar credenciales."""
+    return exchange_sync_service.probar_conexion(body)
+
+
+# ---------------------------------------------------------------------------
+# POST /ingesta/exchange/carpetas — lista carpetas del buzón (ADMIN/EDITOR)
+# ---------------------------------------------------------------------------
+
+@router.post("/ingesta/exchange/carpetas", response_model=ExchangeFoldersOut)
+def listar_carpetas_exchange(
+    body: ExchangeCredencialesIn,
+    _user: Usuario = Depends(require_role("ADMIN", "EDITOR")),
+) -> ExchangeFoldersOut:
+    """Lista carpetas del buzón Exchange/EWS sin guardar credenciales."""
+    return exchange_sync_service.listar_carpetas(body)
+
+
+# ---------------------------------------------------------------------------
+# POST /ingesta/exchange/sync — sincronización manual (ADMIN/EDITOR)
+# ---------------------------------------------------------------------------
+
+@router.post("/ingesta/exchange/sync", response_model=ExchangeSyncOut)
+def sincronizar_exchange(
+    body: ExchangeSyncIn,
+    db: Session = Depends(get_db),
+    _user: Usuario = Depends(require_role("ADMIN", "EDITOR")),
+) -> ExchangeSyncOut:
+    """Sincroniza correos candidatos desde Exchange/EWS.
+
+    Las credenciales son efímeras: se usan solo durante esta petición.
+    """
+    return exchange_sync_service.sincronizar_exchange(db, body)
 
 
 # ---------------------------------------------------------------------------
@@ -81,7 +131,7 @@ def post_correo(
 # GET /ingesta/pendientes — bandeja de revisión
 # ---------------------------------------------------------------------------
 
-_ESTADOS_BANDEJA = Literal["PENDIENTE", "APROBADO_AUTO"]
+_ESTADOS_BANDEJA = Literal["PENDIENTE", "APROBADO", "APROBADO_AUTO", "RECHAZADO"]
 
 
 @router.get("/ingesta/pendientes")
@@ -119,6 +169,49 @@ def get_pendientes(
         correo_outs.append(correo_out)
 
     return IngestaPendientesOut(items=correo_outs, total=len(correo_outs))
+
+
+# ---------------------------------------------------------------------------
+# GET /ingesta/{id} — detalle de un correo de ingesta
+# ---------------------------------------------------------------------------
+
+@router.get("/ingesta/{ingesta_id}", response_model=CorreoIngestaOut)
+def get_correo_ingesta(
+    ingesta_id: int,
+    db: Session = Depends(get_db),
+    _user: Usuario = Depends(get_current_user),
+) -> CorreoIngestaOut:
+    """Devuelve un correo de ingesta con sus documentos."""
+    correo = svc.get_correo(db, ingesta_id)
+    docs = db.execute(
+        select(IngestaDocumento).where(IngestaDocumento.ingesta_correo_id == ingesta_id)
+    ).scalars().all()
+    result = CorreoIngestaOut.model_validate(correo)
+    return result.model_copy(update={
+        "documentos": [DocumentoIngestaOut.model_validate(d) for d in docs]
+    })
+
+
+# ---------------------------------------------------------------------------
+# POST /ingesta/{id}/propuesta — sugerencia de Claude/MCP
+# ---------------------------------------------------------------------------
+
+@router.post("/ingesta/{ingesta_id}/propuesta", response_model=CorreoIngestaOut)
+def guardar_propuesta_correo(
+    ingesta_id: int,
+    body: CorreoPropuestaIn,
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(require_role("ADMIN", "EDITOR")),
+) -> CorreoIngestaOut:
+    """Guarda sugerencias para prellenar el modal de aprobacion humana."""
+    correo = svc.guardar_propuesta_correo(db, ingesta_id, body, current_user.username)
+    docs = db.execute(
+        select(IngestaDocumento).where(IngestaDocumento.ingesta_correo_id == ingesta_id)
+    ).scalars().all()
+    result = CorreoIngestaOut.model_validate(correo)
+    return result.model_copy(update={
+        "documentos": [DocumentoIngestaOut.model_validate(d) for d in docs]
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -160,7 +253,19 @@ def aprobar_correo(
     409 si ya está APROBADO/APROBADO_AUTO/RECHAZADO.
     422 si el proceso no existe o está soft-deleted.
     """
-    correo = svc.aprobar_correo(db, ingesta_id, body.proceso_id, current_user.username)
+    correo = svc.aprobar_correo(
+        db=db,
+        ingesta_id=ingesta_id,
+        proceso_id=body.proceso_id,
+        usuario=current_user.username,
+        etapa_sugerida=body.etapa_sugerida,
+        estado_etapa=body.estado_etapa,
+        fecha_documento=body.fecha_documento,
+        fecha_fin=body.fecha_fin,
+        responsable=body.responsable,
+        oficio_correo=body.oficio_correo,
+        observaciones=body.observaciones,
+    )
     docs = db.execute(
         select(IngestaDocumento).where(IngestaDocumento.ingesta_correo_id == ingesta_id)
     ).scalars().all()
@@ -185,6 +290,28 @@ def rechazar_correo(
     """Marca un correo PENDIENTE como RECHAZADO."""
     correo = svc.rechazar_correo(db, ingesta_id, body.motivo, current_user.username)
     return CorreoIngestaOut.model_validate(correo)
+
+
+# ---------------------------------------------------------------------------
+# POST /ingesta/{id}/restaurar — vuelve RECHAZADO a PENDIENTE
+# ---------------------------------------------------------------------------
+
+@router.post("/ingesta/{ingesta_id}/restaurar", response_model=CorreoIngestaOut)
+def restaurar_correo(
+    ingesta_id: int,
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(require_role("ADMIN", "EDITOR")),
+) -> CorreoIngestaOut:
+    """Restaura un correo rechazado a PENDIENTE para nueva revisión."""
+    correo = svc.restaurar_correo(db, ingesta_id, current_user.username)
+    docs = db.execute(
+        select(IngestaDocumento).where(IngestaDocumento.ingesta_correo_id == ingesta_id)
+    ).scalars().all()
+    result = CorreoIngestaOut.model_validate(correo)
+    result = result.model_copy(update={
+        "documentos": [DocumentoIngestaOut.model_validate(d) for d in docs]
+    })
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -223,6 +350,34 @@ def get_documentos_proceso(
     """Lista documentos vinculados al proceso (pestaña Documentos)."""
     docs = svc.get_documentos_proceso(db, proceso_id)
     return [DocumentoIngestaOut.model_validate(d) for d in docs]
+
+
+# ---------------------------------------------------------------------------
+# GET /procesos/{id}/etapas/{cod}/correos — correos vinculados a una etapa
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/procesos/{proceso_id}/etapas/{codigo_etapa}/correos",
+    response_model=IngestaPendientesOut,
+)
+def get_correos_etapa(
+    proceso_id: int,
+    codigo_etapa: str,
+    db: Session = Depends(get_db),
+    _user: Usuario = Depends(get_current_user),
+) -> IngestaPendientesOut:
+    """Lista correos aprobados vinculados a una etapa concreta del proceso."""
+    correos = svc.get_correos_etapa(db, proceso_id, codigo_etapa)
+    items: list[CorreoIngestaOut] = []
+    for correo in correos:
+        docs = db.execute(
+            select(IngestaDocumento).where(IngestaDocumento.ingesta_correo_id == correo.id)
+        ).scalars().all()
+        out = CorreoIngestaOut.model_validate(correo)
+        items.append(out.model_copy(update={
+            "documentos": [DocumentoIngestaOut.model_validate(d) for d in docs]
+        }))
+    return IngestaPendientesOut(items=items, total=len(items))
 
 
 # ---------------------------------------------------------------------------

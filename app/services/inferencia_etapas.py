@@ -21,11 +21,12 @@ Refinamiento FASE 3 (por-etapa con datos reales):
 """
 from __future__ import annotations
 
+import json
 import unicodedata
 from datetime import date, datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.models.etapa import EtapaRegistro
@@ -165,7 +166,12 @@ def inferir_avance_correo(
     Returns:
         Lista de códigos de etapa marcados (0 o 1 elemento).
     """
-    cod_obj = inferir_etapa_correo(correo.subject, doc_rows)
+    # Prioridad: la ingesta Exchange/MCP puede guardar una etapa sugerida
+    # explícita. Si no existe, se infiere desde asunto/documentos.
+    cod_obj = getattr(correo, "etapa_sugerida", None) or inferir_etapa_correo(
+        correo.subject,
+        doc_rows,
+    )
     if cod_obj is None:
         return []
 
@@ -179,11 +185,7 @@ def inferir_avance_correo(
     if spec.por_area:
         return []
 
-    # Idempotencia: si ya existe fila COMPLETADO, no duplicar
-    if _ya_completada(db, proceso_id, cod_obj):
-        return []
-
-    # Fecha: fecha_documento del correo, fallback received_at.date()
+    # Fecha inicio: fecha_documento del correo, fallback received_at.date()
     fecha: date | None = correo.fecha_documento
     if fecha is None and correo.received_at is not None:
         rv = correo.received_at
@@ -191,18 +193,50 @@ def inferir_avance_correo(
     if fecha is None:
         return []
 
-    # Datos reales del correo
-    responsable = getattr(correo, "sender_name", None)
-    # oficio_correo toma el asunto del correo (truncado a 250) — identificador semántico
-    _subject = getattr(correo, "subject", None)
-    oficio_correo = (_subject[:250] if _subject else None) or None
+    # Datos confirmados por el revisor tienen prioridad sobre lo extraído.
+    estado_etapa = getattr(correo, "estado_etapa_sugerido", None) or "COMPLETADO"
+    fecha_fin = getattr(correo, "fecha_fin_sugerida", None)
+    responsable = getattr(correo, "responsable_sugerido", None) or getattr(correo, "sender_name", None)
+    oficio_correo = getattr(correo, "oficio_correo_sugerido", None) or getattr(correo, "numero_oficio", None)
+    observaciones_extra = getattr(correo, "observaciones_sugeridas", None)
+
+    existente = _fila_existente(db, proceso_id, cod_obj)
+    if existente is not None:
+        # La etapa ya existe: asociamos este correo como soporte adicional.
+        # Guardamos una foto previa para poder dejar la etapa exactamente como
+        # estaba si luego se desvincula este correo.
+        prev = _snapshot_etapa(existente)
+        if existente.estado_etapa != "COMPLETADO":
+            existente.estado_etapa = estado_etapa
+        if existente.fecha_inicio is None:
+            existente.fecha_inicio = fecha
+        if fecha_fin is not None:
+            existente.fecha_fin = fecha_fin
+        if responsable:
+            existente.responsable = responsable
+        if oficio_correo:
+            existente.oficio_correo = oficio_correo
+        prev_line = f"[INGESTA_PREV corr={correo.id}] {json.dumps(prev, ensure_ascii=False)}"
+        nota = f"[INGESTA_LINK corr={correo.id}] Correo vinculado como soporte documental"
+        lineas = [prev_line]
+        if observaciones_extra:
+            lineas.append(observaciones_extra)
+        lineas.append(nota)
+        existente.observaciones = (
+            f"{existente.observaciones}\n" + "\n".join(lineas)
+            if existente.observaciones
+            else "\n".join(lineas)
+        )
+        db.flush()
+        return [cod_obj]
 
     _insertar_fila_inferida(
         db, proceso_id, cod_obj, spec, correo.id, fecha,
+        estado_etapa=estado_etapa,
+        fecha_fin=fecha_fin,
         responsable=responsable,
         oficio_correo=oficio_correo,
-        subject=getattr(correo, "subject", None),
-        body_clean=getattr(correo, "body_clean", None),
+        observaciones_extra=observaciones_extra,
     )
     return [cod_obj]
 
@@ -281,37 +315,78 @@ def _ya_completada(db: Session, proceso_id: int, cod: str) -> bool:
     return row is not None
 
 
-def _construir_observaciones(correo_id: int, subject: str | None, body_clean: str | None) -> str:
-    """Construye el texto de observaciones para una etapa inferida desde correo.
+def _fila_existente(db: Session, proceso_id: int, cod: str) -> EtapaRegistro | None:
+    """Retorna una fila simple vigente de la etapa, si ya existe."""
+    return db.execute(
+        select(EtapaRegistro).where(
+            EtapaRegistro.proceso_id == proceso_id,
+            EtapaRegistro.codigo_etapa == cod,
+            EtapaRegistro.es_bucle.is_(False),
+            EtapaRegistro.area_usuaria.is_(None),
+            EtapaRegistro.estado_etapa != "OMITIDO",
+        )
+    ).scalars().first()
 
-    Formato con body:    "[INGESTA_INFER corr=<id>] <asunto> — <extracto body ~160 chars>"
-    Formato sin body:    "[INGESTA_INFER corr=<id>] <asunto>"
-    Formato sin nada:    "[INGESTA_INFER corr=<id>] Inferido automáticamente desde correo ingestado"
 
-    El prefijo "[INGESTA_INFER corr=<id>]" es INMUTABLE — revertir_avance depende
-    de él para detectar filas por regex corr=(\\d+).
-    El asunto va en observaciones ADEMÁS de en oficio_correo.
-    """
-    prefijo = f"[INGESTA_INFER corr={correo_id}]"
+def _snapshot_etapa(row: EtapaRegistro) -> dict[str, str | None]:
+    """Campos que una vinculación de correo puede tocar y luego restaurar."""
+    return {
+        "estado_etapa": row.estado_etapa,
+        "fecha_inicio": row.fecha_inicio.isoformat() if row.fecha_inicio else None,
+        "fecha_fin": row.fecha_fin.isoformat() if row.fecha_fin else None,
+        "responsable": row.responsable,
+        "oficio_correo": row.oficio_correo,
+    }
 
-    # Limpiar y truncar extracto del cuerpo
-    extracto = ""
-    if body_clean:
-        extracto = body_clean.replace("\n", " ").replace("\r", " ").strip()
-        # Colapsar múltiples espacios en uno
-        while "  " in extracto:
-            extracto = extracto.replace("  ", " ")
-        if len(extracto) > 160:
-            extracto = extracto[:160] + "…"
 
-    asunto = subject.strip() if subject else ""
+def _parse_date(value: str | None) -> date | None:
+    if not value:
+        return None
+    return date.fromisoformat(value)
 
-    if extracto:
-        return f"{prefijo} {extracto}"
-    elif asunto:
-        return f"{prefijo} {asunto}"
-    else:
-        return f"{prefijo} Inferido automáticamente desde correo ingestado"
+
+def _restore_snapshot_etapa(row: EtapaRegistro, snapshot: dict[str, str | None]) -> None:
+    row.estado_etapa = snapshot.get("estado_etapa") or "PENDIENTE"
+    row.fecha_inicio = _parse_date(snapshot.get("fecha_inicio"))
+    row.fecha_fin = _parse_date(snapshot.get("fecha_fin"))
+    row.responsable = snapshot.get("responsable")
+    row.oficio_correo = snapshot.get("oficio_correo")
+
+
+def _extraer_snapshot_obs(observaciones: str, correo_id: int) -> dict[str, str | None] | None:
+    prefix = f"[INGESTA_PREV corr={correo_id}] "
+    for line in observaciones.splitlines():
+        if not line.startswith(prefix):
+            continue
+        try:
+            data = json.loads(line[len(prefix):])
+        except json.JSONDecodeError:
+            return None
+        return data if isinstance(data, dict) else None
+    return None
+
+
+def _limpiar_marcas_correo(observaciones: str | None, correo_id: int) -> str | None:
+    if not observaciones:
+        return observaciones
+    markers = (
+        f"[INGESTA_PREV corr={correo_id}]",
+        f"[INGESTA_LINK corr={correo_id}]",
+        f"[INGESTA_INFER corr={correo_id}]",
+    )
+    lines = [
+        line for line in observaciones.splitlines()
+        if not any(marker in line for marker in markers)
+    ]
+    return "\n".join(lines) or None
+
+
+def _tiene_otro_link_activo(observaciones: str, correo_id: int) -> bool:
+    own = f"[INGESTA_LINK corr={correo_id}]"
+    return any(
+        "[INGESTA_LINK corr=" in line and own not in line
+        for line in observaciones.splitlines()
+    )
 
 
 def _insertar_fila_inferida(
@@ -321,10 +396,11 @@ def _insertar_fila_inferida(
     spec,
     correo_id: int,
     fecha: date,
+    estado_etapa: str = "COMPLETADO",
+    fecha_fin: date | None = None,
     responsable: str | None = None,
     oficio_correo: str | None = None,
-    subject: str | None = None,
-    body_clean: str | None = None,
+    observaciones_extra: str | None = None,
 ) -> EtapaRegistro:
     """INSERT directo de EtapaRegistro COMPLETADO con marca de trazabilidad.
 
@@ -332,20 +408,22 @@ def _insertar_fila_inferida(
     - registrado_por = 'INGESTA_INFER'
     - responsable = sender_name del correo (datos reales — REFINAMIENTO FASE 3)
     - oficio_correo = numero_oficio del correo (datos reales — REFINAMIENTO FASE 3)
-    - observaciones contiene '[INGESTA_INFER corr={correo_id}]' para la reversa parcial,
-      más asunto y extracto del body_clean del correo para trazabilidad humana.
+    - observaciones contiene '[INGESTA_INFER corr={correo_id}]' para la reversa parcial.
     - NO llama sync_montos (garantía Q1).
     - NO valida prerequisitos (garantía Q2).
     """
-    observaciones = _construir_observaciones(correo_id, subject, body_clean)
+    marca = f"[INGESTA_INFER corr={correo_id}] Inferido automáticamente desde correo ingestado"
+    observaciones = marca
+    if observaciones_extra:
+        observaciones = f"{observaciones_extra}\n{marca}"
     row = EtapaRegistro(
         proceso_id=proceso_id,
         codigo_etapa=cod,
         nombre_etapa=spec.nombre,
         area_responsable=spec.area_responsable,
         fecha_inicio=fecha,
-        fecha_fin=fecha,
-        estado_etapa="COMPLETADO",
+        fecha_fin=fecha_fin,
+        estado_etapa=estado_etapa,
         registrado_por="INGESTA_INFER",
         responsable=responsable,
         oficio_correo=oficio_correo,
@@ -367,26 +445,54 @@ def revertir_avance(
     proceso_id: int,
     correo_id: int,
 ) -> int:
-    """Elimina SOLO las filas EtapaRegistro marcadas con este correo_id.
+    """Revierte las filas EtapaRegistro afectadas por este correo.
 
-    La marca '[INGESTA_INFER corr={correo_id}]' en observaciones y
-    registrado_por='INGESTA_INFER' identifican exclusivamente las filas de este correo.
-    Las filas manuales (registrado_por != 'INGESTA_INFER') no se tocan nunca.
+    No borra físicamente etapas_registro: pueden tener historial_cambios
+    referenciándolas y la auditoría debe preservarse. En su lugar:
+    - Si actualizó una etapa existente, restaura los campos previos.
+    - Si la etapa fue creada únicamente por este correo, la desasocia del
+      proceso para que el flujo quede como antes de la vinculación.
 
-    Returns:
-        Número de filas eliminadas.
+    Las filas sin marcas de ingesta no se tocan nunca.
     """
-    marca = f"[INGESTA_INFER corr={correo_id}]"
+    marca_infer = f"[INGESTA_INFER corr={correo_id}]"
+    marca_link = f"[INGESTA_LINK corr={correo_id}]"
     filas = db.execute(
         select(EtapaRegistro).where(
             EtapaRegistro.proceso_id == proceso_id,
-            EtapaRegistro.registrado_por == "INGESTA_INFER",
-            EtapaRegistro.observaciones.like(f"%{marca}%"),
+            or_(
+                EtapaRegistro.observaciones.like(f"%{marca_infer}%"),
+                EtapaRegistro.observaciones.like(f"%{marca_link}%"),
+            ),
         )
     ).scalars().all()
 
     for fila in filas:
-        db.delete(fila)
+        obs = fila.observaciones or ""
+        snapshot = _extraer_snapshot_obs(obs, correo_id)
+
+        if snapshot is not None:
+            if not _tiene_otro_link_activo(obs, correo_id):
+                _restore_snapshot_etapa(fila, snapshot)
+            fila.observaciones = _limpiar_marcas_correo(fila.observaciones, correo_id)
+            continue
+
+        if marca_link in obs:
+            fila.observaciones = _limpiar_marcas_correo(fila.observaciones, correo_id)
+            continue
+
+        if marca_infer in obs:
+            if "[INGESTA_LINK corr=" in obs:
+                fila.observaciones = fila.observaciones.replace(
+                    marca_infer,
+                    f"[INGESTA_UNLINKED corr={correo_id}]",
+                ) if fila.observaciones else None
+            else:
+                fila.proceso_id = None
+                fila.observaciones = fila.observaciones.replace(
+                    marca_infer,
+                    f"[INGESTA_DETACHED corr={correo_id}]",
+                ) if fila.observaciones else None
 
     db.flush()
     return len(filas)

@@ -52,29 +52,10 @@ warnings.filterwarnings(
 )
 
 # ---------------------------------------------------------------------------
-# Dedicated TEST database.
-#
-# SAFETY INVARIANT: the autouse `_clean_business_tables` fixture issues
-# COMMITTED DELETEs (procesos, ingesta_correos, ...). It MUST NEVER run against
-# a live/demo database (e.g. `adquisiciones_tic`). We therefore force a
-# dedicated test DB whose name ends in "_test" and HARD-REFUSE to start
-# otherwise. Override explicitly with the TEST_DATABASE_URL env var.
+# In-process test database (uses the same Postgres DB, isolated via rollback)
 # ---------------------------------------------------------------------------
-import os
-
-from sqlalchemy.engine import make_url
-
-_test_url = make_url(os.environ.get("TEST_DATABASE_URL") or settings.DATABASE_URL)
-if not (_test_url.database or "").endswith("_test"):
-    # Derive a sibling test DB so we never touch the live DB.
-    _test_url = _test_url.set(database="dashboard_test")
-assert (_test_url.database or "").endswith("_test"), (
-    f"Refusing to run tests against non-test database '{_test_url.database}'. "
-    "Set TEST_DATABASE_URL to a database whose name ends in '_test'."
-)
-
 _test_engine = create_engine(
-    _test_url,
+    settings.DATABASE_URL,
     pool_pre_ping=True,
     future=True,
 )

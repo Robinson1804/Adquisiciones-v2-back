@@ -12,6 +12,7 @@ Functions > 50 lines are split into private helpers per coding conventions.
 """
 from __future__ import annotations
 
+import re
 from datetime import date, datetime, timezone
 from decimal import Decimal
 
@@ -47,10 +48,77 @@ _BUCLE_CODS: frozenset[str] = frozenset(
     cod for cod, spec in ETAPAS_CATALOGO.items() if spec.es_bucle
 )
 
+_INGESTA_INFER_RE = re.compile(
+    r"\[INGESTA_INFER corr=\d+\]\s*Inferido automáticamente desde correo ingestado\.?\s*"
+)
+_INGESTA_LINK_RE = re.compile(
+    r"\[INGESTA_LINK corr=\d+\]\s*Correo vinculado como soporte documental\.?\s*"
+)
+_INGESTA_META_LINE_RE = re.compile(
+    r"^\[INGESTA_(?:PREV|UNLINKED|DETACHED|OMITIDO) corr=\d+\].*$"
+)
+
 
 # ---------------------------------------------------------------------------
 # Write operations
 # ---------------------------------------------------------------------------
+
+def limpiar_observaciones_ingesta(observaciones: str | None) -> str | None:
+    """Oculta marcas internas de ingesta antes de responder al frontend."""
+    if not observaciones:
+        return observaciones
+
+    visibles: list[str] = []
+    for raw in observaciones.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if _INGESTA_META_LINE_RE.match(line):
+            continue
+        line = _INGESTA_INFER_RE.sub("", line)
+        line = _INGESTA_LINK_RE.sub("", line)
+        line = line.strip()
+        if line:
+            visibles.append(line)
+
+    return "\n".join(visibles) or None
+
+
+def _extraer_marcas_ingesta(observaciones: str | None) -> list[str]:
+    """Extrae solo marcas internas necesarias para revertir ingesta."""
+    if not observaciones:
+        return []
+
+    marcas: list[str] = []
+    for raw in observaciones.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("[INGESTA_PREV corr="):
+            marcas.append(line)
+            continue
+        infer = re.search(r"\[INGESTA_INFER corr=\d+\]", line)
+        if infer:
+            marcas.append(f"{infer.group(0)} Inferido automáticamente desde correo ingestado")
+            continue
+        link = re.search(r"\[INGESTA_LINK corr=\d+\]", line)
+        if link:
+            marcas.append(f"{link.group(0)} Correo vinculado como soporte documental")
+
+    return marcas
+
+
+def _merge_observaciones_con_marcas(
+    observaciones_visibles: str | None,
+    observaciones_previas: str | None,
+) -> str | None:
+    """Guarda lo editado por el usuario sin perder metadatos internos."""
+    partes: list[str] = []
+    visible = observaciones_visibles.strip() if observaciones_visibles else ""
+    if visible:
+        partes.append(visible)
+    partes.extend(_extraer_marcas_ingesta(observaciones_previas))
+    return "\n".join(partes) or None
 
 def registrar_etapa(
     db: Session,
@@ -223,8 +291,28 @@ def actualizar_etapa(
         if nuevo is None:
             continue
         antes = getattr(etapa, campo)
+
+        if campo == "observaciones":
+            nuevo_guardado = _merge_observaciones_con_marcas(nuevo, antes)
+            antes_visible = limpiar_observaciones_ingesta(antes)
+            nuevo_visible = nuevo.strip() if isinstance(nuevo, str) else nuevo
+            if str(antes_visible) == str(nuevo_visible):
+                continue
+            _registrar_auditoria(
+                db,
+                proceso_id=etapa.proceso_id,
+                etapa_id=etapa.id,
+                campo=campo,
+                antes=antes_visible,
+                nuevo=nuevo_visible,
+                usuario=current_user_username,
+            )
+            setattr(etapa, campo, nuevo_guardado)
+            continue
+
         if str(antes) == str(nuevo):
             continue
+
         _registrar_auditoria(
             db,
             proceso_id=etapa.proceso_id,
@@ -523,6 +611,22 @@ def reiniciar_tdr(
 # Progreso calculation (pure function — Design D2)
 # ---------------------------------------------------------------------------
 
+def _es_omitido_ingesta(row: EtapaRegistro) -> bool:
+    """True para filas antiguas que la ingesta dejó en OMITIDO al desvincular."""
+    return row.estado_etapa == "OMITIDO" and row.registrado_por == "INGESTA_INFER"
+
+
+def _filtrar_omitidos_ingesta(rows: list[EtapaRegistro]) -> list[EtapaRegistro]:
+    """Oculta filas OMITIDO generadas por la reversa vieja de ingesta."""
+    return [row for row in rows if not _es_omitido_ingesta(row)]
+
+
+def _preferir_filas_activas(rows: list[EtapaRegistro]) -> list[EtapaRegistro]:
+    """Si hay filas activas de un código, no usar OMITIDO para estado/form."""
+    activas = [row for row in rows if row.estado_etapa != "OMITIDO"]
+    return activas or rows
+
+
 def calcular_progreso(etapas_rows: list[EtapaRegistro]) -> ProgresoOut:
     """Derive etapa_actual and progress % from etapas_registro rows.
 
@@ -544,6 +648,8 @@ def calcular_progreso(etapas_rows: list[EtapaRegistro]) -> ProgresoOut:
     - CULMINADO override: if proceso is CULMINADO the caller sets porcentaje=100
       directly (handled in GET route, not here); here we just compute from rows.
     """
+    etapas_rows = _filtrar_omitidos_ingesta(etapas_rows)
+
     # Group rows by codigo_etapa
     by_cod: dict[str, list[EtapaRegistro]] = {}
     for row in etapas_rows:
@@ -602,6 +708,8 @@ def _estado_consolidado(spec, rows: list[EtapaRegistro]) -> str:
     if not rows:
         return "PENDIENTE"
 
+    rows = _preferir_filas_activas(rows)
+
     if spec.es_bucle:
         # Last ronda (highest nro_ronda) determines the estado
         last = max(rows, key=lambda r: r.nro_ronda)
@@ -637,6 +745,8 @@ def agrupar_etapas(
     One EtapaAgrupadaOut per cod in ORDEN_ETAPAS (all 27 entries, even with
     no rows — those appear as PENDIENTE with empty filas/rondas).
     """
+    etapas_rows = _filtrar_omitidos_ingesta(etapas_rows)
+
     by_cod: dict[str, list[EtapaRegistro]] = {}
     for row in etapas_rows:
         by_cod.setdefault(row.codigo_etapa, []).append(row)
@@ -693,6 +803,7 @@ def _build_rondas(rows: list[EtapaRegistro]) -> list[RondaBucleOut]:
 
 def _build_filas(rows: list[EtapaRegistro], cod: str) -> list[FilaAreaOut]:
     """Build filas list sorted by area_usuaria ASC (then id for stability)."""
+    rows = _preferir_filas_activas(rows)
     sorted_rows = sorted(
         rows,
         key=lambda r: (r.area_usuaria or "", r.id),
@@ -718,7 +829,7 @@ def _build_filas(rows: list[EtapaRegistro], cod: str) -> list[FilaAreaOut]:
                 fecha_resp_otpp=r.fecha_resp_otpp,
                 responsable=r.responsable,
                 oficio_correo=r.oficio_correo,
-                observaciones=r.observaciones,
+                observaciones=limpiar_observaciones_ingesta(r.observaciones),
                 registrado_por=r.registrado_por,
                 vencimiento_ocs=vencimiento_ocs,
             )

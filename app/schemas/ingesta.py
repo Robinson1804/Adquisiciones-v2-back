@@ -42,6 +42,11 @@ _CONTENT_TYPES_PERMITIDOS: frozenset[str] = frozenset(
         "image/gif",
         "image/tiff",
         "image/webp",
+        "application/zip",
+        "application/x-zip-compressed",
+        "application/vnd.rar",
+        "application/x-rar-compressed",
+        "application/x-7z-compressed",
     ]
 )
 
@@ -108,6 +113,14 @@ class CorreoIngestaIn(BaseModel):
     fecha_documento: date | None = None
     fecha_recepcion: date | None = None
 
+    # Sugerencia de clasificación/revisión (opcional; Exchange/MCP/Claude)
+    relevancia_score: float | None = Field(default=None, ge=0.0, le=1.0)
+    relevancia_motivos: str | None = None
+    proceso_sugerido_id: int | None = Field(default=None, gt=0)
+    etapa_sugerida: str | None = None
+    fase_sugerida: str | None = None
+    resumen_sugerido: str | None = None
+
     documentos: list[DocumentoExtraidoIn] = Field(default_factory=list)
 
 
@@ -163,6 +176,13 @@ class CorreoIngestaOut(BaseModel):
     motivo_rechazo: str | None
     revisado_por: str | None
     revisado_en: datetime | None
+    # Sugerencia de clasificación/revisión
+    relevancia_score: float | None = None
+    relevancia_motivos: str | None = None
+    proceso_sugerido_id: int | None = None
+    etapa_sugerida: str | None = None
+    fase_sugerida: str | None = None
+    resumen_sugerido: str | None = None
     creado_en: datetime
     # Documentos adjuntos (opcional: puede no venir en todos los endpoints)
     documentos: list[DocumentoIngestaOut] = Field(default_factory=list)
@@ -204,13 +224,88 @@ class CorreoCorreccionIn(BaseModel):
     fecha_recepcion: date | None = None
 
 
+class CorreoPropuestaIn(BaseModel):
+    """Propuesta externa para prellenar la revisión humana de un correo."""
+
+    proceso_sugerido_id: int | None = Field(default=None, gt=0)
+    proceso_sugerido_codigo: str | None = Field(default=None, max_length=20)
+    etapa_sugerida: str | None = Field(default=None, max_length=10)
+    fase_sugerida: str | None = Field(default=None, max_length=80)
+    resumen_sugerido: str | None = None
+    relevancia_motivos: str | None = None
+    relevancia_score: float | None = Field(default=None, ge=0.0, le=1.0)
+    fecha_documento: date | None = None
+    numero_oficio: str | None = Field(default=None, max_length=120)
+
+
 class AprobarIn(BaseModel):
     """Body del POST /ingesta/{id}/aprobar."""
 
     proceso_id: int = Field(..., gt=0)
+    etapa_sugerida: str | None = Field(default=None, max_length=20)
+    estado_etapa: Literal["PENDIENTE", "EN_CURSO", "COMPLETADO"] = "COMPLETADO"
+    fecha_documento: date | None = None
+    fecha_fin: date | None = None
+    responsable: str | None = Field(default=None, max_length=255)
+    oficio_correo: str | None = Field(default=None, max_length=120)
+    observaciones: str | None = None
 
 
 class RechazarIn(BaseModel):
     """Body del POST /ingesta/{id}/rechazar."""
 
     motivo: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Schemas Exchange manual (frontend de pruebas → backend)
+# ---------------------------------------------------------------------------
+
+
+class ExchangeCredencialesIn(BaseModel):
+    """Credenciales temporales para probar/sincronizar Exchange/EWS."""
+
+    servidor: str = Field(..., min_length=1, max_length=255)
+    email: str = Field(..., min_length=3, max_length=255)
+    usuario: str = Field(..., min_length=1, max_length=255)
+    password: str = Field(..., min_length=1, max_length=255)
+    carpeta: str = Field(default="Bandeja de entrada", min_length=1, max_length=120)
+
+
+class ExchangeSyncIn(ExchangeCredencialesIn):
+    """Solicitud de sincronización manual desde /ingesta."""
+
+    limite: int = Field(default=20, ge=1, le=100)
+    solo_no_leidos: bool = False
+    remitente: str | None = Field(default=None, max_length=255)
+    umbral_relevancia: float = Field(default=0.35, ge=0.0, le=1.0)
+    descargar_adjuntos: bool = True
+
+
+class ExchangeTestOut(BaseModel):
+    conectado: bool
+    cuenta: str | None = None
+    total_bandeja: int | None = None
+    mensaje: str
+
+
+class ExchangeFolderOut(BaseModel):
+    nombre: str
+    total: int | None = None
+    no_leidos: int | None = None
+
+
+class ExchangeFoldersOut(BaseModel):
+    items: list[ExchangeFolderOut]
+    total: int
+
+
+class ExchangeSyncOut(BaseModel):
+    carpeta: str
+    revisados: int
+    candidatos: int
+    creados: int
+    duplicados: int
+    auto_vinculados: int
+    descartados: int
+    errores: list[str] = Field(default_factory=list)

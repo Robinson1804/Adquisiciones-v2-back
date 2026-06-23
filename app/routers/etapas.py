@@ -31,6 +31,7 @@ from app.services.etapas_service import (
     agregar_ronda_bucle,
     agrupar_etapas,
     calcular_progreso,
+    limpiar_observaciones_ingesta,
     registrar_etapa,
     reiniciar_tdr,
 )
@@ -79,6 +80,7 @@ def _etapa_to_out(etapa: EtapaRegistro) -> EtapaOut:
 
     out = EtapaOut.model_validate(etapa)
     out.vencimiento_ocs = vencimiento_ocs
+    out.observaciones = limpiar_observaciones_ingesta(out.observaciones)
     return out
 
 

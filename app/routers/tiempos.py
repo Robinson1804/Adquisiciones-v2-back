@@ -1,11 +1,4 @@
-"""Tiempos router — cross-process timing heatmap matrix.
-
-Endpoint: GET /tiempos/matriz
-  - Optional filters: anno (int), estado (str), tipo (str), q (str)
-  - Auth: any authenticated role (read-only)
-  - N+1 prevention: loads ALL EtapaRegistro for matched procesos in one IN(...) query
-  - Delegates aggregation to tiempos_matriz.construir_matriz (pure)
-"""
+"""Read-only endpoints for timing analysis."""
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends
@@ -32,15 +25,7 @@ def get_matriz_tiempos(
     db: Session = Depends(get_db),
     _user: Usuario = Depends(get_current_user),
 ) -> MatrizTiemposOut:
-    """Return cross-process timing heatmap matrix.
-
-    Filters mirror list_procesos (same fields, same comparisons, same null handling).
-    q filters by id_proceso OR requerimiento (case-insensitive contains) — mirrors
-    the `search` param in list_procesos exactly.
-    Rows ordered by id_proceso ascending for a stable heatmap.
-    N+1 avoided: one Proceso query + one batch EtapaRegistro IN(...) query.
-    """
-    # Build proceso query — mirrors list_procesos filter logic exactly
+    """Return the cross-process timing matrix with optional filters."""
     stmt = select(Proceso).where(Proceso.eliminado_en.is_(None))
     if anno is not None:
         stmt = stmt.where(Proceso.anno == anno)
@@ -54,16 +39,11 @@ def get_matriz_tiempos(
             Proceso.requerimiento.ilike(pattern) | Proceso.id_proceso.ilike(pattern)
         )
 
-    # Order by id_proceso asc for stable heatmap rows
-    stmt = stmt.order_by(Proceso.id_proceso.asc())
-
-    procesos = list(db.execute(stmt).scalars().all())
-
+    procesos = list(db.execute(stmt.order_by(Proceso.id_proceso.asc())).scalars().all())
     if not procesos:
         return construir_matriz([], [])
 
-    # Batch load all EtapaRegistro rows for the matched procesos — ONE query
-    proceso_ids = [p.id for p in procesos]
+    proceso_ids = [proceso.id for proceso in procesos]
     etapas_rows = list(
         db.execute(
             select(EtapaRegistro).where(EtapaRegistro.proceso_id.in_(proceso_ids))
