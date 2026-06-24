@@ -40,6 +40,14 @@ class ProcesoFlujoOut(BaseModel):
     etapa_actual: str | None
     etapa_actual_nombre: str | None
     fase_actual_dias: int | None
+    pia: float | None
+    pim: float | None
+    monto_cert_total: float | None
+    monto_ocs: float | None
+    atencion_compromiso_mensual: float | None
+    devengado: float | None
+    girado: float | None
+    avance_ejecucion: float | None
     porcentaje: float
     fases: list[FaseProgresoOut]
 
@@ -76,10 +84,15 @@ class PresupuestoProcesoOut(BaseModel):
     id_proceso: str
     requerimiento: str
     estado: str
+    pia: float | None
     pim: float | None
     valor_em: float | None
     monto_cert_total: float | None
     monto_ocs: float | None
+    atencion_compromiso_mensual: float | None
+    devengado: float | None
+    girado: float | None
+    avance_ejecucion: float | None
     var_em_vs_pim: float | None
     var_cert_vs_em: float | None
     var_ocs_vs_em: float | None
@@ -87,7 +100,7 @@ class PresupuestoProcesoOut(BaseModel):
 
 class PresupuestoResponse(BaseModel):
     anno: int
-    totales: dict[str, float | None]   # pim, valor_em, monto_cert_total, monto_ocs
+    totales: dict[str, float | None]
     procesos: list[PresupuestoProcesoOut]
 
 

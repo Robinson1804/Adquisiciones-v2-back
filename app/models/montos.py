@@ -15,10 +15,14 @@ class MontosProceso(Base):
     proceso_id: Mapped[int] = mapped_column(
         ForeignKey("procesos.id", ondelete="CASCADE"), unique=True
     )
+    pia: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
     valor_em: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
     monto_cert_total: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
     nro_ocs: Mapped[str | None] = mapped_column(String(50))
     monto_ocs: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
+    atencion_compromiso_mensual: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
+    devengado: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
+    girado: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
     plazo_entrega: Mapped[int | None] = mapped_column(Integer)
     fecha_inicio_srv: Mapped[date | None] = mapped_column(Date)
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMP, server_default=func.now())

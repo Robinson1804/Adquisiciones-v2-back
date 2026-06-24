@@ -111,9 +111,13 @@ class MontosOut(BaseModel):
     the frontend MontosProceso type (number | null)."""
     model_config = ConfigDict(from_attributes=True)
 
+    pia: float | None = None
     valor_em: float | None = None
     monto_cert_total: float | None = None
     nro_ocs: str | None = None
     monto_ocs: float | None = None
+    atencion_compromiso_mensual: float | None = None
+    devengado: float | None = None
+    girado: float | None = None
     plazo_entrega: int | None = None
     fecha_inicio_srv: date | None = None

@@ -280,6 +280,33 @@ def test_flujo_procesos_fase_actual_dias(db_session):
     assert proc.fase_actual_dias == 3
 
 
+def test_flujo_procesos_includes_budget_data(db_session):
+    """Phase board payload includes per-acquisition budget execution data."""
+    p = _create_proceso_direct(db_session, pim=Decimal("1000"))
+    db_session.add(MontosProceso(
+        proceso_id=p.id,
+        pia=Decimal("900"),
+        monto_cert_total=Decimal("800"),
+        monto_ocs=Decimal("700"),
+        atencion_compromiso_mensual=Decimal("600"),
+        devengado=Decimal("500"),
+        girado=Decimal("400"),
+    ))
+    db_session.flush()
+
+    result = dashboard_service.get_flujo_procesos(db_session, 2026)
+    proc = result.procesos[0]
+
+    assert proc.pia == pytest.approx(900.0)
+    assert proc.pim == pytest.approx(1000.0)
+    assert proc.monto_cert_total == pytest.approx(800.0)
+    assert proc.monto_ocs == pytest.approx(700.0)
+    assert proc.atencion_compromiso_mensual == pytest.approx(600.0)
+    assert proc.devengado == pytest.approx(500.0)
+    assert proc.girado == pytest.approx(400.0)
+    assert proc.avance_ejecucion == pytest.approx(50.0)
+
+
 # ---------------------------------------------------------------------------
 # T4 — get_tiempos_etapa
 # ---------------------------------------------------------------------------
@@ -364,7 +391,9 @@ def test_tiempos_etapa_promedio_global(db_session):
 def test_presupuesto_empty_year(db_session):
     result = dashboard_service.get_presupuesto(db_session, 1999)
     assert result.procesos == []
+    assert result.totales["pia"] == 0.0
     assert result.totales["pim"] == 0.0
+    assert result.totales["avance_ejecucion"] is None
 
 
 def test_presupuesto_variaciones(db_session):
@@ -376,6 +405,7 @@ def test_presupuesto_variaciones(db_session):
         valor_em=Decimal("110"),
         monto_cert_total=Decimal("90"),
         monto_ocs=Decimal("115"),
+        devengado=Decimal("50"),
     )
     db_session.add(montos)
     db_session.flush()
@@ -386,6 +416,7 @@ def test_presupuesto_variaciones(db_session):
     assert proc.var_em_vs_pim == pytest.approx(10.0, abs=0.2)
     assert proc.var_cert_vs_em == pytest.approx(-18.2, abs=0.2)
     assert proc.var_ocs_vs_em == pytest.approx(4.5, abs=0.2)
+    assert proc.avance_ejecucion == pytest.approx(50.0, abs=0.2)
 
 
 def test_presupuesto_null_safe(db_session):
@@ -407,10 +438,15 @@ def test_presupuesto_no_montos_row(db_session):
     result = dashboard_service.get_presupuesto(db_session, 2026)
     assert len(result.procesos) == 1
     proc = result.procesos[0]
+    assert proc.pia is None
     assert proc.pim == pytest.approx(5000.0)
     assert proc.valor_em is None
     assert proc.monto_cert_total is None
     assert proc.monto_ocs is None
+    assert proc.atencion_compromiso_mensual is None
+    assert proc.devengado is None
+    assert proc.girado is None
+    assert proc.avance_ejecucion is None
     assert proc.var_em_vs_pim is None
 
 
@@ -418,14 +454,26 @@ def test_presupuesto_totales_sum(db_session):
     """totales = SUM of each column, NULL treated as 0."""
     p1 = _create_proceso_direct(db_session, pim=Decimal("100"))
     p2 = _create_proceso_direct(db_session, pim=Decimal("200"))
-    montos1 = MontosProceso(proceso_id=p1.id, valor_em=Decimal("90"))
+    montos1 = MontosProceso(
+        proceso_id=p1.id,
+        pia=Decimal("80"),
+        valor_em=Decimal("90"),
+        atencion_compromiso_mensual=Decimal("40"),
+        devengado=Decimal("30"),
+        girado=Decimal("20"),
+    )
     db_session.add(montos1)
     db_session.flush()
 
     result = dashboard_service.get_presupuesto(db_session, 2026)
+    assert result.totales["pia"] == pytest.approx(80.0, abs=0.01)
     assert result.totales["pim"] == pytest.approx(300.0, abs=0.01)
     assert result.totales["valor_em"] == pytest.approx(90.0, abs=0.01)
     assert result.totales["monto_ocs"] == pytest.approx(0.0, abs=0.01)
+    assert result.totales["atencion_compromiso_mensual"] == pytest.approx(40.0, abs=0.01)
+    assert result.totales["devengado"] == pytest.approx(30.0, abs=0.01)
+    assert result.totales["girado"] == pytest.approx(20.0, abs=0.01)
+    assert result.totales["avance_ejecucion"] == pytest.approx(10.0, abs=0.01)
 
 
 # ---------------------------------------------------------------------------
@@ -608,6 +656,14 @@ def test_flujo_procesos_response_shape(client, admin_headers, db_session):
     assert "etapa_actual" in proc
     assert "etapa_actual_nombre" in proc
     assert "fase_actual_dias" in proc
+    assert "pia" in proc
+    assert "pim" in proc
+    assert "monto_cert_total" in proc
+    assert "monto_ocs" in proc
+    assert "atencion_compromiso_mensual" in proc
+    assert "devengado" in proc
+    assert "girado" in proc
+    assert "avance_ejecucion" in proc
     assert "fases" in proc
     assert len(proc["fases"]) == 5
 

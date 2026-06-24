@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from datetime import date
 
-from sqlalchemy import func, select
+from sqlalchemy import func, inspect, select
 from sqlalchemy.orm import Session
 
 from app.models.etapa import EtapaRegistro
@@ -86,6 +86,65 @@ def _variacion(nuevo, base) -> float | None:
     if nuevo is None or base is None or float(base) == 0:
         return None
     return round((float(nuevo) - float(base)) / float(base) * 100, 1)
+
+
+def _money_float(value) -> float | None:
+    """Convert nullable Decimal-like monetary values to float for schemas."""
+    return float(value) if value is not None else None
+
+
+def _avance_ejecucion(devengado: float | None, pim: float | None) -> float | None:
+    """Return Devengado / PIM * 100, null-safe."""
+    if devengado is None or pim is None or pim == 0:
+        return None
+    return round((devengado / pim) * 100, 1)
+
+
+def _get_montos_by_proc(
+    db: Session,
+    proceso_ids: list[int],
+) -> dict[int, dict[str, object]]:
+    """Load montos_proceso using only columns that exist in the active DB.
+
+    This keeps dashboard reads compatible while a local database is pending the
+    latest optional budget-fields migration.
+    """
+    if not proceso_ids:
+        return {}
+
+    available_cols = {
+        col["name"]
+        for col in inspect(db.bind).get_columns("montos_proceso")
+    }
+    wanted_cols = [
+        "pia",
+        "valor_em",
+        "monto_cert_total",
+        "nro_ocs",
+        "monto_ocs",
+        "atencion_compromiso_mensual",
+        "devengado",
+        "girado",
+        "plazo_entrega",
+        "fecha_inicio_srv",
+    ]
+    selected_cols = [MontosProceso.proceso_id]
+    selected_cols.extend(
+        getattr(MontosProceso, col).label(col)
+        for col in wanted_cols
+        if col in available_cols
+    )
+
+    rows = db.execute(
+        select(*selected_cols).where(MontosProceso.proceso_id.in_(proceso_ids))
+    ).all()
+
+    result: dict[int, dict[str, object]] = {}
+    for row in rows:
+        data = dict(row._mapping)
+        proceso_id = data.pop("proceso_id")
+        result[proceso_id] = data
+    return result
 
 
 def _dashboard_fase_de_cod(cod: str | None) -> str | None:
@@ -269,16 +328,26 @@ def get_flujo_procesos(db: Session, anno: int) -> FlujoProcesosResponse:
             EtapaRegistro.proceso_id.in_(proceso_ids)
         )
     ).scalars().all()
+    montos_by_proc = _get_montos_by_proc(db, proceso_ids)
 
     etapas_by_proc: dict[int, list[EtapaRegistro]] = {}
     for row in etapas_rows:
         etapas_by_proc.setdefault(row.proceso_id, []).append(row)
-
     result = []
     for p in procesos:
         rows = etapas_by_proc.get(p.id, [])
+        montos = montos_by_proc.get(p.id, {})
         progreso = calcular_progreso(rows)
         etapa_actual = progreso.etapa_actual
+        pim = _money_float(p.pim)
+        pia = _money_float(montos.get("pia"))
+        monto_cert = _money_float(montos.get("monto_cert_total"))
+        monto_ocs = _money_float(montos.get("monto_ocs"))
+        atencion_mensual = (
+            _money_float(montos.get("atencion_compromiso_mensual"))
+        )
+        devengado = _money_float(montos.get("devengado"))
+        girado = _money_float(montos.get("girado"))
 
         if p.estado == "CULMINADO":
             # CULMINADO override: process is fully done; no "current" phase.
@@ -313,6 +382,14 @@ def get_flujo_procesos(db: Session, anno: int) -> FlujoProcesosResponse:
                 fase_dashboard_actual,
                 en_proceso=p.estado == "EN PROCESO",
             ),
+            pia=pia,
+            pim=pim,
+            monto_cert_total=monto_cert,
+            monto_ocs=monto_ocs,
+            atencion_compromiso_mensual=atencion_mensual,
+            devengado=devengado,
+            girado=girado,
+            avance_ejecucion=_avance_ejecucion(devengado, pim),
             porcentaje=porcentaje,
             fases=fases,
         ))
@@ -421,49 +498,89 @@ def get_presupuesto(db: Session, anno: int) -> PresupuestoResponse:
     Variations computed server-side via _variacion() (null-safe).
     Totales = SUM of each monetary field (NULL treated as 0).
     """
-    rows = db.execute(
-        select(Proceso, MontosProceso).outerjoin(
-            MontosProceso,
-            Proceso.id == MontosProceso.proceso_id,
-        ).where(
+    procesos = db.execute(
+        select(Proceso).where(
             Proceso.anno == anno,
             Proceso.eliminado_en.is_(None),
         ).order_by(Proceso.id)
-    ).all()
+    ).scalars().all()
 
-    if not rows:
+    if not procesos:
         return PresupuestoResponse(
             anno=anno,
-            totales={"pim": 0.0, "valor_em": 0.0, "monto_cert_total": 0.0, "monto_ocs": 0.0},
+            totales={
+                "pia": 0.0,
+                "pim": 0.0,
+                "valor_em": 0.0,
+                "monto_cert_total": 0.0,
+                "monto_ocs": 0.0,
+                "atencion_compromiso_mensual": 0.0,
+                "devengado": 0.0,
+                "girado": 0.0,
+                "avance_ejecucion": None,
+            },
             procesos=[],
         )
 
+    montos_by_proc = _get_montos_by_proc(db, [p.id for p in procesos])
     procesos_out = []
+    sum_pia = 0.0
     sum_pim = 0.0
     sum_em = 0.0
     sum_cert = 0.0
     sum_ocs = 0.0
+    sum_atencion_mensual = 0.0
+    sum_devengado = 0.0
+    sum_girado = 0.0
+    has_pia = False
+    has_atencion_mensual = False
+    has_devengado = False
+    has_girado = False
 
-    for proceso, montos in rows:
-        pim = float(proceso.pim) if proceso.pim is not None else None
-        valor_em = float(montos.valor_em) if montos and montos.valor_em is not None else None
-        monto_cert = float(montos.monto_cert_total) if montos and montos.monto_cert_total is not None else None
-        monto_ocs = float(montos.monto_ocs) if montos and montos.monto_ocs is not None else None
+    for proceso in procesos:
+        montos = montos_by_proc.get(proceso.id, {})
+        pia = _money_float(montos.get("pia"))
+        pim = _money_float(proceso.pim)
+        valor_em = _money_float(montos.get("valor_em"))
+        monto_cert = _money_float(montos.get("monto_cert_total"))
+        monto_ocs = _money_float(montos.get("monto_ocs"))
+        atencion_mensual = (
+            _money_float(montos.get("atencion_compromiso_mensual"))
+        )
+        devengado = _money_float(montos.get("devengado"))
+        girado = _money_float(montos.get("girado"))
 
-        sum_pim += float(proceso.pim) if proceso.pim is not None else 0.0
-        sum_em += float(montos.valor_em) if montos and montos.valor_em is not None else 0.0
-        sum_cert += float(montos.monto_cert_total) if montos and montos.monto_cert_total is not None else 0.0
-        sum_ocs += float(montos.monto_ocs) if montos and montos.monto_ocs is not None else 0.0
+        if pia is not None:
+            has_pia = True
+            sum_pia += pia
+        sum_pim += pim or 0.0
+        sum_em += valor_em or 0.0
+        sum_cert += monto_cert or 0.0
+        sum_ocs += monto_ocs or 0.0
+        if atencion_mensual is not None:
+            has_atencion_mensual = True
+            sum_atencion_mensual += atencion_mensual
+        if devengado is not None:
+            has_devengado = True
+            sum_devengado += devengado
+        if girado is not None:
+            has_girado = True
+            sum_girado += girado
 
         procesos_out.append(PresupuestoProcesoOut(
             id=proceso.id,
             id_proceso=proceso.id_proceso,
             requerimiento=proceso.requerimiento,
             estado=proceso.estado,
+            pia=pia,
             pim=pim,
             valor_em=valor_em,
             monto_cert_total=monto_cert,
             monto_ocs=monto_ocs,
+            atencion_compromiso_mensual=atencion_mensual,
+            devengado=devengado,
+            girado=girado,
+            avance_ejecucion=_avance_ejecucion(devengado, pim),
             var_em_vs_pim=_variacion(valor_em, pim),
             var_cert_vs_em=_variacion(monto_cert, valor_em),
             var_ocs_vs_em=_variacion(monto_ocs, valor_em),
@@ -472,10 +589,19 @@ def get_presupuesto(db: Session, anno: int) -> PresupuestoResponse:
     return PresupuestoResponse(
         anno=anno,
         totales={
+            "pia": sum_pia if has_pia else None,
             "pim": sum_pim,
             "valor_em": sum_em,
             "monto_cert_total": sum_cert,
             "monto_ocs": sum_ocs,
+            "atencion_compromiso_mensual": (
+                sum_atencion_mensual if has_atencion_mensual else None
+            ),
+            "devengado": sum_devengado if has_devengado else None,
+            "girado": sum_girado if has_girado else None,
+            "avance_ejecucion": (
+                _avance_ejecucion(sum_devengado, sum_pim) if has_devengado else None
+            ),
         },
         procesos=procesos_out,
     )

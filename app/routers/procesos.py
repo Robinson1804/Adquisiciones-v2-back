@@ -12,7 +12,7 @@ from datetime import date, datetime, timezone
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import func, select, text
+from sqlalchemy import func, inspect, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -42,6 +42,40 @@ router = APIRouter(prefix="/procesos", tags=["procesos"])
 _E01_NOMBRE = "Solicitud de requerimiento TIC (Áreas → OTIN)"  # legacy — kept for migration refs
 _E01A_NOMBRE = "Solicitud inicial área iniciadora (Área → OTIN)"
 _MAX_ID_RETRIES = 3
+
+
+def _get_montos_out_compat(db: Session, proceso_id: int) -> MontosOut | None:
+    """Read montos_proceso without requiring optional new columns to exist."""
+    available_cols = {
+        col["name"]
+        for col in inspect(db.bind).get_columns("montos_proceso")
+    }
+    wanted_cols = [
+        "pia",
+        "valor_em",
+        "monto_cert_total",
+        "nro_ocs",
+        "monto_ocs",
+        "atencion_compromiso_mensual",
+        "devengado",
+        "girado",
+        "plazo_entrega",
+        "fecha_inicio_srv",
+    ]
+    selected_cols = [
+        getattr(MontosProceso, col).label(col)
+        for col in wanted_cols
+        if col in available_cols
+    ]
+    if not selected_cols:
+        return None
+
+    row = db.execute(
+        select(*selected_cols).where(MontosProceso.proceso_id == proceso_id)
+    ).first()
+    if row is None:
+        return None
+    return MontosOut(**dict(row._mapping))
 
 
 def _generar_id_proceso(db: Session, anno: int) -> str:
@@ -279,10 +313,7 @@ def get_montos_proceso(
     _user: Usuario = Depends(get_current_user),
 ) -> MontosOut | None:
     _get_active_proceso_or_404(db, proceso_id)
-    montos = db.execute(
-        select(MontosProceso).where(MontosProceso.proceso_id == proceso_id)
-    ).scalar_one_or_none()
-    return MontosOut.model_validate(montos) if montos else None
+    return _get_montos_out_compat(db, proceso_id)
 
 
 # ---------------------------------------------------------------------------

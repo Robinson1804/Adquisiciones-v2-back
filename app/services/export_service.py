@@ -219,8 +219,9 @@ def build_excel(db: Session, anno: int) -> bytes:
     # ---- Sheet: Montos ----
     ws_mont = wb.create_sheet("Montos")
     _style_header_row(ws_mont, [
-        "id_proceso", "id_proceso_legible", "valor_em",
+        "id_proceso", "id_proceso_legible", "pia", "valor_em",
         "monto_cert_total", "nro_ocs", "monto_ocs",
+        "atencion_compromiso_mensual", "devengado", "girado",
         "plazo_entrega", "fecha_inicio_srv",
     ])
 
@@ -229,10 +230,14 @@ def build_excel(db: Session, anno: int) -> bytes:
         ws_mont.append([
             p.id,
             p.id_proceso,
+            _fmt_float(m.pia) if m else "",
             _fmt_float(m.valor_em) if m else "",
             _fmt_float(m.monto_cert_total) if m else "",
             m.nro_ocs if m and m.nro_ocs else "",
             _fmt_float(m.monto_ocs) if m else "",
+            _fmt_float(m.atencion_compromiso_mensual) if m else "",
+            _fmt_float(m.devengado) if m else "",
+            _fmt_float(m.girado) if m else "",
             m.plazo_entrega if m and m.plazo_entrega is not None else "",
             _fmt_date(m.fecha_inicio_srv) if m else "",
         ])
@@ -383,10 +388,14 @@ def build_pdf(db: Session, proceso_id: int) -> bytes:
     if montos:
         montos_data = [
             ["Concepto", "Valor"],
+            ["PIA", _fmt_money(montos.pia) or "—"],
             ["Valor Estimado de Mercado (EM)", _fmt_money(montos.valor_em) or "—"],
             ["Monto Certificado Total", _fmt_money(montos.monto_cert_total) or "—"],
             ["Número de OCS", montos.nro_ocs or "—"],
             ["Monto OCS", _fmt_money(montos.monto_ocs) or "—"],
+            ["Atención de Compromiso Mensual", _fmt_money(montos.atencion_compromiso_mensual) or "—"],
+            ["Devengado", _fmt_money(montos.devengado) or "—"],
+            ["Girado", _fmt_money(montos.girado) or "—"],
             ["Plazo de Entrega (días)", str(montos.plazo_entrega) if montos.plazo_entrega is not None else "—"],
             ["Fecha Inicio Servicio", _fmt_date(montos.fecha_inicio_srv) or "—"],
         ]
