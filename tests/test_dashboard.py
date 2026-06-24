@@ -209,6 +209,9 @@ def test_flujo_procesos_fase_from_etapa(db_session):
     assert len(result.procesos) == 1
     proc = result.procesos[0]
     assert proc.fase_actual == "F3"
+    assert proc.etapa_actual == "E12"
+    assert proc.etapa_actual_nombre == ETAPAS_CATALOGO["E12"].nombre
+    assert proc.fase_actual_dias is None
     # F1 and F2 are completed
     fases_map = {f.fase: f for f in proc.fases}
     assert fases_map["F1"].completada is True
@@ -224,6 +227,8 @@ def test_flujo_procesos_culminado(db_session):
     result = dashboard_service.get_flujo_procesos(db_session, 2026)
     proc = result.procesos[0]
     assert proc.fase_actual is None
+    assert proc.etapa_actual == "E25"
+    assert proc.etapa_actual_nombre == ETAPAS_CATALOGO["E25"].nombre
     assert proc.porcentaje == 100.0
     for fase in proc.fases:
         assert fase.completada is True
@@ -245,11 +250,34 @@ def test_flujo_procesos_cancelado(db_session):
 
     result = dashboard_service.get_flujo_procesos(db_session, 2026)
     proc = result.procesos[0]
+    assert proc.etapa_actual == "E03"
     fases_map = {f.fase: f for f in proc.fases}
     assert fases_map["F1"].completada is True
     assert fases_map["F2"].completada is False
     assert fases_map["F4"].completada is False
     assert fases_map["F5"].completada is False
+
+
+def test_flujo_procesos_fase_actual_dias(db_session):
+    """fase_actual_dias uses the calendar span inside the current visual phase."""
+    p = _create_proceso_direct(db_session, estado="CANCELADO")
+    for cod in ["E01a", "E01b", "E01c", "E02", "E02b"]:
+        kwargs = {"area_usuaria": "DTDIS"} if cod == "E01c" else {}
+        _insert_etapa(db_session, p.id, cod, **kwargs)
+
+    _insert_etapa(
+        db_session,
+        p.id,
+        "E03",
+        fecha_inicio=date(2026, 3, 1),
+        fecha_fin=date(2026, 3, 4),
+    )
+
+    result = dashboard_service.get_flujo_procesos(db_session, 2026)
+    proc = result.procesos[0]
+
+    assert proc.etapa_actual == "E04"
+    assert proc.fase_actual_dias == 3
 
 
 # ---------------------------------------------------------------------------
@@ -576,6 +604,10 @@ def test_flujo_procesos_response_shape(client, admin_headers, db_session):
     assert "procesos" in body
     assert len(body["procesos"]) == 1
     proc = body["procesos"][0]
+    assert "fase_actual" in proc
+    assert "etapa_actual" in proc
+    assert "etapa_actual_nombre" in proc
+    assert "fase_actual_dias" in proc
     assert "fases" in proc
     assert len(proc["fases"]) == 5
 

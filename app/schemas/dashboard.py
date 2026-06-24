@@ -37,6 +37,9 @@ class ProcesoFlujoOut(BaseModel):
     requerimiento: str
     estado: str
     fase_actual: str | None
+    etapa_actual: str | None
+    etapa_actual_nombre: str | None
+    fase_actual_dias: int | None
     porcentaje: float
     fases: list[FaseProgresoOut]
 

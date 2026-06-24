@@ -8,6 +8,8 @@ No writes. No mutations. Design authority: design #152.
 """
 from __future__ import annotations
 
+from datetime import date
+
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -52,6 +54,17 @@ _MAIN_CODS_ORDERED: list[str] = [
     cod for cod in ORDEN_ETAPAS if cod not in _BUCLE_CODS
 ]
 
+_DASHBOARD_FASE_DE_ETAPA: dict[str, str] = {
+    "E01a": "F1", "E01b": "F1", "E01c": "F1", "E02": "F1", "E02b": "F1",
+    "E03": "F2", "E04": "F2", "E05": "F2", "E06": "F2", "E06b": "F2",
+    "E06c": "F2", "E07": "F2", "E08": "F2", "E08a": "F2", "E08b": "F2",
+    "E09": "F3", "E10": "F3", "E11": "F3", "E12": "F3", "E13": "F3",
+    "E14": "F3", "E15": "F3", "E16": "F3",
+    "E17": "F4", "E18": "F4", "E19": "F4", "E20": "F4", "E21": "F4",
+    "E22": "F4",
+    "E23": "F5", "E24": "F5", "E25": "F5",
+}
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -73,6 +86,53 @@ def _variacion(nuevo, base) -> float | None:
     if nuevo is None or base is None or float(base) == 0:
         return None
     return round((float(nuevo) - float(base)) / float(base) * 100, 1)
+
+
+def _dashboard_fase_de_cod(cod: str | None) -> str | None:
+    """Return the visual dashboard phase for a stage code."""
+    if cod is None:
+        return None
+    return _DASHBOARD_FASE_DE_ETAPA.get(cod)
+
+
+def _nombre_etapa(cod: str | None) -> str | None:
+    """Return the catalog display name for a stage code."""
+    if cod is None:
+        return None
+    spec = ETAPAS_CATALOGO.get(cod)
+    return spec.nombre if spec else None
+
+
+def _dias_en_fase_dashboard(
+    rows: list[EtapaRegistro],
+    fase_actual: str | None,
+    *,
+    en_proceso: bool,
+) -> int | None:
+    """Calendar days elapsed inside the visual dashboard phase."""
+    if fase_actual is None:
+        return None
+
+    inicios = []
+    cierres = []
+    for row in rows:
+        if row.estado_etapa == "OMITIDO":
+            continue
+        if _dashboard_fase_de_cod(row.codigo_etapa) != fase_actual:
+            continue
+        if row.fecha_inicio is not None:
+            inicios.append(row.fecha_inicio)
+        if row.fecha_fin is not None:
+            cierres.append(row.fecha_fin)
+        elif row.fecha_inicio is not None:
+            cierres.append(row.fecha_inicio)
+
+    if not inicios:
+        return None
+
+    inicio = min(inicios)
+    fin = date.today() if en_proceso else max(cierres or inicios)
+    return max(0, (fin - inicio).days)
 
 
 # ---------------------------------------------------------------------------
@@ -218,12 +278,14 @@ def get_flujo_procesos(db: Session, anno: int) -> FlujoProcesosResponse:
     for p in procesos:
         rows = etapas_by_proc.get(p.id, [])
         progreso = calcular_progreso(rows)
+        etapa_actual = progreso.etapa_actual
 
         if p.estado == "CULMINADO":
             # CULMINADO override: process is fully done; no "current" phase.
             # porcentaje=100, fase_actual=None, all fases completada=True.
             fase_actual = None
             porcentaje = 100.0
+            etapa_actual = "E25"
         else:
             if progreso.etapa_actual and progreso.etapa_actual in COD_A_FASE:
                 fase_actual = fase_de_cod(progreso.etapa_actual)
@@ -232,6 +294,11 @@ def get_flujo_procesos(db: Session, anno: int) -> FlujoProcesosResponse:
             porcentaje = progreso.porcentaje
 
         fases = _build_fases_progreso(fase_actual or "F5", p.estado)
+        fase_dashboard_actual = (
+            "F5"
+            if p.estado == "CULMINADO"
+            else (_dashboard_fase_de_cod(etapa_actual) or fase_actual or "F1")
+        )
 
         result.append(ProcesoFlujoOut(
             id=p.id,
@@ -239,6 +306,13 @@ def get_flujo_procesos(db: Session, anno: int) -> FlujoProcesosResponse:
             requerimiento=p.requerimiento,
             estado=p.estado,
             fase_actual=fase_actual,
+            etapa_actual=etapa_actual,
+            etapa_actual_nombre=_nombre_etapa(etapa_actual),
+            fase_actual_dias=_dias_en_fase_dashboard(
+                rows,
+                fase_dashboard_actual,
+                en_proceso=p.estado == "EN PROCESO",
+            ),
             porcentaje=porcentaje,
             fases=fases,
         ))
