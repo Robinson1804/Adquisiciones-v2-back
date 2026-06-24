@@ -200,6 +200,17 @@ def inferir_avance_correo(
     oficio_correo = getattr(correo, "oficio_correo_sugerido", None) or getattr(correo, "numero_oficio", None)
     observaciones_extra = getattr(correo, "observaciones_sugeridas", None)
 
+    from app.services.etapas_service import _autocompletar_previas_sin_evidencia
+
+    if estado_etapa in ("COMPLETADO", "EN_CURSO"):
+        _autocompletar_previas_sin_evidencia(
+            db,
+            proceso_id,
+            cod_obj,
+            fecha,
+            "INGESTA_INFER",
+        )
+
     existente = _fila_existente(db, proceso_id, cod_obj)
     if existente is not None:
         # La etapa ya existe: asociamos este correo como soporte adicional.
@@ -254,8 +265,8 @@ def inferir_avance(
     fecha: date,
 ) -> list[str]:
     """[DEPRECADO — usar inferir_avance_correo] Recorre la CADENA desde el inicio
-    hasta la etapa objetivo e inserta filas COMPLETADO para cada etapa que NO sea
-    por_area y NO esté ya COMPLETADO.
+    hasta la etapa objetivo. Las etapas previas quedan SIN_EVIDENCIA; la etapa
+    objetivo queda COMPLETADO porque es la que tiene soporte del correo.
 
     FIX Q1: usa INSERT directo de EtapaRegistro (sin registrar_etapa) para que
     sync_montos NO se dispare y no pise montos_proceso existentes con None.
@@ -292,24 +303,35 @@ def inferir_avance(
         if spec.por_area:
             continue
 
-        # Idempotencia: si ya existe fila COMPLETADO, saltar
+        # Idempotencia: si ya existe fila satisfecha, saltar
         if _ya_completada(db, proceso_id, cod):
             continue
 
-        _insertar_fila_inferida(db, proceso_id, cod, spec, correo_id, fecha)
+        estado = "COMPLETADO" if cod == cod_obj else "SIN_EVIDENCIA"
+        _insertar_fila_inferida(
+            db,
+            proceso_id,
+            cod,
+            spec,
+            correo_id,
+            fecha,
+            estado_etapa=estado,
+        )
         marcadas.append(cod)
 
     return marcadas
 
 
 def _ya_completada(db: Session, proceso_id: int, cod: str) -> bool:
-    """True si existe al menos una fila no-bucle COMPLETADO para este cod."""
+    """True si existe al menos una fila no-bucle que satisface la cadena."""
     row = db.execute(
         select(EtapaRegistro).where(
             EtapaRegistro.proceso_id == proceso_id,
             EtapaRegistro.codigo_etapa == cod,
             EtapaRegistro.es_bucle.is_(False),
-            EtapaRegistro.estado_etapa == "COMPLETADO",
+            EtapaRegistro.estado_etapa.in_(
+                ["COMPLETADO", "SIN_EVIDENCIA", "NO_APLICA"]
+            ),
         )
     ).scalars().first()
     return row is not None
@@ -402,7 +424,7 @@ def _insertar_fila_inferida(
     oficio_correo: str | None = None,
     observaciones_extra: str | None = None,
 ) -> EtapaRegistro:
-    """INSERT directo de EtapaRegistro COMPLETADO con marca de trazabilidad.
+    """INSERT directo de EtapaRegistro inferido con marca de trazabilidad.
 
     - fecha_inicio = fecha_fin = fecha del documento (ADR-D7: marcamos el HITO).
     - registrado_por = 'INGESTA_INFER'
@@ -422,7 +444,7 @@ def _insertar_fila_inferida(
         nombre_etapa=spec.nombre,
         area_responsable=spec.area_responsable,
         fecha_inicio=fecha,
-        fecha_fin=fecha_fin,
+        fecha_fin=fecha_fin or fecha,
         estado_etapa=estado_etapa,
         registrado_por="INGESTA_INFER",
         responsable=responsable,

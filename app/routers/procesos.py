@@ -418,7 +418,7 @@ def registrar_orden_servicio(
     """Wizard: batch-register E14-E20 in a single transaction.
 
     Preconditions:
-    - E13 must be COMPLETADO (or NO_APLICA) → 422 otherwise.
+    - E13 must be COMPLETADO, NO_APLICA or SIN_EVIDENCIA → 422 otherwise.
     - E19 must not already exist → 409 otherwise.
     All stages use body.fecha_os as fecha_inicio unless overridden via body.fechas_estimadas.
     """
@@ -427,18 +427,23 @@ def registrar_orden_servicio(
 
     _get_active_proceso_or_404(db, proceso_id)
 
-    # Precondition: E13 COMPLETADO or NO_APLICA
+    # Precondition: E13 satisfies the chain.
     e13 = db.execute(
         select(EtapaRegistro).where(
             EtapaRegistro.proceso_id == proceso_id,
             EtapaRegistro.codigo_etapa == "E13",
-            EtapaRegistro.estado_etapa.in_(["COMPLETADO", "NO_APLICA"]),
+            EtapaRegistro.estado_etapa.in_(
+                ["COMPLETADO", "NO_APLICA", "SIN_EVIDENCIA"]
+            ),
         )
     ).scalar_one_or_none()
     if e13 is None:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="E13 debe estar COMPLETADO o NO_APLICA antes de registrar la O/S.",
+            detail=(
+                "E13 debe estar COMPLETADO, NO_APLICA o SIN_EVIDENCIA "
+                "antes de registrar la O/S."
+            ),
         )
 
     # Precondition: E19 must not exist

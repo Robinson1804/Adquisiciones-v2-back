@@ -186,7 +186,7 @@ class TestInferirAvance:
     """Tests de integración con DB real (dashboard_test)."""
 
     def test_conformidad_infiere_cadena_hasta_e23(self, db_session):
-        """CONFORMIDAD → E23: todas las etapas cadena hasta E23 (excl. por_area) quedan COMPLETADO."""
+        """CONFORMIDAD → E23: previas SIN_EVIDENCIA y objetivo COMPLETADO."""
         from app.services.inferencia_etapas import inferir_avance
         from app.services.etapas_catalogo import CADENA, ETAPAS_CATALOGO
 
@@ -198,7 +198,8 @@ class TestInferirAvance:
 
         assert len(marcadas) > 0
 
-        # Todas las del prefijo hasta E23 (no por_area) deben estar COMPLETADO
+        # Todas las del prefijo hasta E23 (no por_area) deben estar resueltas:
+        # previas SIN_EVIDENCIA; E23 COMPLETADO porque tiene soporte real.
         idx_e23 = CADENA.index("E23")
         prefijo = CADENA[: idx_e23 + 1]
         por_area_cods = {cod for cod in prefijo if ETAPAS_CATALOGO[cod].por_area}
@@ -206,14 +207,14 @@ class TestInferirAvance:
         rows = db_session.execute(
             __import__("sqlalchemy").select(EtapaRegistro).where(
                 EtapaRegistro.proceso_id == proceso.id,
-                EtapaRegistro.estado_etapa == "COMPLETADO",
             )
         ).scalars().all()
-        completadas_cods = {r.codigo_etapa for r in rows}
+        estados_por_cod = {r.codigo_etapa: r.estado_etapa for r in rows}
 
         for cod in prefijo:
             if cod not in por_area_cods:
-                assert cod in completadas_cods, f"{cod} deberia estar COMPLETADO"
+                esperado = "COMPLETADO" if cod == "E23" else "SIN_EVIDENCIA"
+                assert estados_por_cod[cod] == esperado, f"{cod} deberia estar {esperado}"
 
     def test_cadena_no_incluye_etapas_por_area(self, db_session):
         """E01c y E11 (por_area) NO deben ser inferidas."""
@@ -845,10 +846,10 @@ class TestInferirEtapaCorreo:
 # ---------------------------------------------------------------------------
 
 class TestInferirAvanceSinCascada:
-    """La nueva inferencia marca SOLO la etapa inferida, no la cadena anterior."""
+    """La inferencia deja verde solo la etapa inferida con evidencia real."""
 
     def test_conformidad_marca_solo_e23_no_cadena(self, db_session):
-        """Correo de conformidad → SOLO E23 COMPLETADO, no la cadena E01..E22."""
+        """Correo de conformidad → solo E23 COMPLETADO; previas quedan SIN_EVIDENCIA."""
         from app.services.inferencia_etapas import inferir_avance_correo
 
         proceso = _make_proceso(db_session)
@@ -877,6 +878,14 @@ class TestInferirAvanceSinCascada:
 
         # Solo E23 debe estar COMPLETADO
         assert completadas == {"E23"}, f"Solo E23 debe quedar COMPLETADO, obtuvo {completadas}"
+
+        previas = db_session.execute(
+            __import__("sqlalchemy").select(EtapaRegistro).where(
+                EtapaRegistro.proceso_id == proceso.id,
+                EtapaRegistro.estado_etapa == "SIN_EVIDENCIA",
+            )
+        ).scalars().all()
+        assert len(previas) > 0
 
     def test_cotizacion_marca_solo_e03(self, db_session):
         """Correo de cotización → SOLO E03 COMPLETADO."""

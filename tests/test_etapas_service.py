@@ -142,6 +142,41 @@ def test_registrar_etapa_no_historial(db_session):
     assert len(count) == 0
 
 
+def test_registrar_etapa_posterior_autocompleta_previas_sin_evidencia(db_session):
+    """A real jump marks previous chain stages as SIN_EVIDENCIA."""
+    proc = _make_proceso(db_session, areas=["DTDIS"])
+    payload = EtapaCreate(
+        codigo_etapa="E04",
+        nombre_etapa="OTA deriva expediente a OEAS",
+        fecha_inicio=date(2026, 6, 10),
+        fecha_fin=date(2026, 6, 10),
+        estado_etapa="COMPLETADO",
+    )
+
+    registrar_etapa(db_session, proc.id, payload, "editor1")
+
+    rows = db_session.execute(
+        select(EtapaRegistro).where(EtapaRegistro.proceso_id == proc.id)
+    ).scalars().all()
+    by_cod = {row.codigo_etapa: row for row in rows}
+
+    for cod in ["E01a", "E01b", "E02", "E02b", "E03"]:
+        assert by_cod[cod].estado_etapa == "SIN_EVIDENCIA"
+        assert by_cod[cod].fecha_inicio == date(2026, 6, 10)
+        assert by_cod[cod].fecha_fin == date(2026, 6, 10)
+
+    e01c = [
+        row for row in rows
+        if row.codigo_etapa == "E01c" and row.area_usuaria == "DTDIS"
+    ]
+    assert len(e01c) == 1
+    assert e01c[0].estado_etapa == "SIN_EVIDENCIA"
+
+    progreso = calcular_progreso(list(rows))
+    assert progreso.completadas == 7
+    assert progreso.etapa_actual == "E07"
+
+
 # ---------------------------------------------------------------------------
 # agregar_ronda_bucle
 # ---------------------------------------------------------------------------

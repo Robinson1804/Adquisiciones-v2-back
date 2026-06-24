@@ -209,6 +209,7 @@ def test_r2_e10_validado_no_cancel(client, editor_headers, db_session):
 def test_r3_e12_blocked_e11_pendiente(client, editor_headers, db_session):
     """R3 BLOCKED: POST E12 when any E11 row is PENDIENTE → 409."""
     proc = _create_proceso(client, editor_headers, areas=["DTDIS", "GOBERNANZA"])
+    _setup_chain_prereqs(db_session, proc["id"], "E11")
     # E11 rows: DTDIS COMPLETADO, GOBERNANZA PENDIENTE
     _insert_etapa(
         db_session, proc["id"], "E11",
@@ -308,6 +309,7 @@ def test_r4_e16_no_alerta(client, editor_headers, db_session):
 def test_r5_e25_blocked_e24_pendiente(client, editor_headers, db_session):
     """R5 BLOCKED: POST E25 when any E24 row PENDIENTE → 409."""
     proc = _create_proceso(client, editor_headers, areas=["DTDIS", "GOBERNANZA"])
+    _setup_chain_prereqs(db_session, proc["id"], "E24")
     _insert_etapa(
         db_session, proc["id"], "E24",
         estado="COMPLETADO", area_usuaria="DTDIS",
@@ -451,6 +453,7 @@ def test_cancelado_proceso_blocks_all_etapas(client, editor_headers, db_session)
 def test_prereq_generico_e09_sin_e08_completado(client, editor_headers, db_session):
     """Prereq genérico: POST E09 without E08 COMPLETADO at all → 409."""
     proc = _create_proceso(client, editor_headers)
+    _setup_chain_prereqs(db_session, proc["id"], "E08")
     # E08 exists but NOT COMPLETADO
     _insert_etapa(
         db_session, proc["id"], "E08",

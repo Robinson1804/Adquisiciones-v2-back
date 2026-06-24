@@ -25,7 +25,7 @@ class EtapaRegistro(Base):
     __tablename__ = "etapas_registro"
     __table_args__ = (
         CheckConstraint(
-            "estado_etapa IN ('COMPLETADO','EN_CURSO','PENDIENTE','CANCELADO','OMITIDO','NO_APLICA')",
+            "estado_etapa IN ('COMPLETADO','EN_CURSO','PENDIENTE','CANCELADO','OMITIDO','NO_APLICA','SIN_EVIDENCIA')",
             name="ck_etapas_estado",
         ),
         CheckConstraint(

@@ -15,12 +15,15 @@ from __future__ import annotations
 from datetime import date
 
 from fastapi import HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.models.etapa import EtapaRegistro
 from app.models.proceso import Proceso
 from app.services.etapas_catalogo import ETAPAS_CATALOGO
+
+
+_ESTADOS_SATISFACEN = {"COMPLETADO", "NO_APLICA", "SIN_EVIDENCIA"}
 
 
 # ---------------------------------------------------------------------------
@@ -138,7 +141,7 @@ def validar_r6_bucle_tdr(db: Session, proceso_id: int) -> None:
         select(EtapaRegistro).where(
             EtapaRegistro.proceso_id == proceso_id,
             EtapaRegistro.codigo_etapa == "E04",
-            EtapaRegistro.estado_etapa == "COMPLETADO",
+            EtapaRegistro.estado_etapa.in_(_ESTADOS_SATISFACEN),
         )
     ).scalars().first()
     if fila_e04 is None:
@@ -153,12 +156,15 @@ def validar_r6_bucle_tdr(db: Session, proceso_id: int) -> None:
 # ---------------------------------------------------------------------------
 
 def validar_r7_e09(db: Session, proceso_id: int) -> None:
-    """R7: E09 requiere que E08 tenga resultado_eval = 'APROBADO'."""
+    """R7: E09 requiere E08 aprobado o inferido sin evidencia."""
     fila_e08 = db.execute(
         select(EtapaRegistro).where(
             EtapaRegistro.proceso_id == proceso_id,
             EtapaRegistro.codigo_etapa == "E08",
-            EtapaRegistro.resultado_eval == "APROBADO",
+            or_(
+                EtapaRegistro.resultado_eval == "APROBADO",
+                EtapaRegistro.estado_etapa == "SIN_EVIDENCIA",
+            ),
         )
     ).scalars().first()
     if fila_e08 is None:
@@ -214,12 +220,15 @@ def validar_prerequisito_generico(
         ).scalars().all()
 
         # NO_APLICA satisfies prerequisites — the stage was intentionally skipped.
+        # SIN_EVIDENCIA also satisfies: a later document proved the flow advanced,
+        # but no support document was registered for this previous stage.
         # OMITIDO is NOT equivalent (reserved for reinicio-TDR flow).
-        _SATISFIES = {"COMPLETADO", "NO_APLICA"}
 
         if prereq_spec.por_area:
             # Todas las filas por área deben ser COMPLETADO o NO_APLICA
-            if not rows or not all(r.estado_etapa in _SATISFIES for r in rows):
+            if not rows or not all(
+                r.estado_etapa in _ESTADOS_SATISFACEN for r in rows
+            ):
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
                     detail=f"Prerequisito {prereq_cod} no completado para {cod}",
@@ -232,14 +241,14 @@ def validar_prerequisito_generico(
                     detail=f"Prerequisito {prereq_cod} no completado para {cod}",
                 )
             last = max(rows, key=lambda r: r.nro_ronda)
-            if last.estado_etapa not in _SATISFIES:
+            if last.estado_etapa not in _ESTADOS_SATISFACEN:
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
                     detail=f"Prerequisito {prereq_cod} no completado para {cod}",
                 )
         else:
             # Etapa simple: debe existir una fila COMPLETADO o NO_APLICA
-            satisfecha = any(r.estado_etapa in _SATISFIES for r in rows)
+            satisfecha = any(r.estado_etapa in _ESTADOS_SATISFACEN for r in rows)
             if not satisfecha:
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,

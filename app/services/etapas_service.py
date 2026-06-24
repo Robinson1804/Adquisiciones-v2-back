@@ -34,6 +34,7 @@ from app.schemas.etapa import (
     RondaBucleOut,
 )
 from app.services.etapas_catalogo import (
+    CADENA,
     ETAPAS_CATALOGO,
     ORDEN_ETAPAS,
     PROGRESO_DENOMINATOR,
@@ -46,6 +47,17 @@ from app.services.etapas_catalogo import (
 
 _BUCLE_CODS: frozenset[str] = frozenset(
     cod for cod, spec in ETAPAS_CATALOGO.items() if spec.es_bucle
+)
+_ESTADOS_SATISFACEN: frozenset[str] = frozenset(
+    {"COMPLETADO", "NO_APLICA", "SIN_EVIDENCIA"}
+)
+_ESTADOS_COMPLETAN_AVANCE: frozenset[str] = frozenset(
+    {"COMPLETADO", "SIN_EVIDENCIA"}
+)
+_AUTOCOMPLETAR_SALTO_MINIMO = 2
+_SIN_EVIDENCIA_OBS = (
+    "Marcado automaticamente como completado sin evidencia por registro "
+    "de una etapa posterior."
 )
 
 _INGESTA_INFER_RE = re.compile(
@@ -120,6 +132,183 @@ def _merge_observaciones_con_marcas(
     partes.extend(_extraer_marcas_ingesta(observaciones_previas))
     return "\n".join(partes) or None
 
+
+def _codigo_satisfecho_para_backfill(
+    spec,
+    rows: list[EtapaRegistro],
+    areas_usuarias: list[str],
+) -> bool:
+    """Evalua si un codigo previo ya satisface el avance automatico."""
+    if not rows:
+        return False
+
+    rows = _preferir_filas_activas(rows)
+
+    if spec.es_bucle:
+        last = max(rows, key=lambda r: r.nro_ronda)
+        return last.estado_etapa in _ESTADOS_SATISFACEN
+
+    if spec.por_area:
+        if areas_usuarias:
+            rows_por_area = {
+                r.area_usuaria: r
+                for r in rows
+                if r.area_usuaria in areas_usuarias
+            }
+            if len(rows_por_area) < len(areas_usuarias):
+                return False
+            return all(
+                r.estado_etapa in _ESTADOS_SATISFACEN
+                for r in rows_por_area.values()
+            )
+        return all(r.estado_etapa in _ESTADOS_SATISFACEN for r in rows)
+
+    return any(r.estado_etapa in _ESTADOS_SATISFACEN for r in rows)
+
+
+def _actualizar_fila_sin_evidencia(
+    row: EtapaRegistro,
+    fecha_referencia: date,
+    current_user_username: str,
+) -> None:
+    """Marca una fila existente como completada inferida sin perder contexto."""
+    if row.estado_etapa in _ESTADOS_SATISFACEN:
+        return
+
+    row.estado_etapa = "SIN_EVIDENCIA"
+    if row.fecha_inicio is None:
+        row.fecha_inicio = fecha_referencia
+    if row.fecha_fin is None:
+        row.fecha_fin = fecha_referencia
+    if row.observaciones:
+        if _SIN_EVIDENCIA_OBS not in row.observaciones:
+            row.observaciones = f"{row.observaciones}\n{_SIN_EVIDENCIA_OBS}"
+    else:
+        row.observaciones = _SIN_EVIDENCIA_OBS
+    row.actualizado_por = current_user_username
+    row.actualizado_en = datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _crear_fila_sin_evidencia(
+    proceso_id: int,
+    cod: str,
+    spec,
+    area_usuaria: str | None,
+    fecha_referencia: date,
+    current_user_username: str,
+) -> EtapaRegistro:
+    return EtapaRegistro(
+        proceso_id=proceso_id,
+        codigo_etapa=cod,
+        nombre_etapa=spec.nombre,
+        area_responsable=spec.area_responsable,
+        fecha_inicio=fecha_referencia,
+        fecha_fin=fecha_referencia,
+        estado_etapa="SIN_EVIDENCIA",
+        area_usuaria=area_usuaria,
+        es_bucle=False,
+        nro_ronda=1,
+        observaciones=_SIN_EVIDENCIA_OBS,
+        registrado_por=current_user_username,
+    )
+
+
+def _autocompletar_previas_sin_evidencia(
+    db: Session,
+    proceso_id: int,
+    cod: str,
+    fecha_referencia: date,
+    current_user_username: str,
+) -> None:
+    """Completa etapas previas inferidas cuando se registra un salto real."""
+    if cod not in CADENA:
+        return
+
+    target_idx = CADENA.index(cod)
+    if target_idx <= 0:
+        return
+
+    prev_cods = list(CADENA[:target_idx])
+    proceso = db.get(Proceso, proceso_id)
+    areas_usuarias = list(proceso.areas_usuarias or []) if proceso else []
+
+    rows_previas = db.execute(
+        select(EtapaRegistro).where(
+            EtapaRegistro.proceso_id == proceso_id,
+            EtapaRegistro.codigo_etapa.in_(prev_cods),
+        )
+    ).scalars().all()
+    by_cod: dict[str, list[EtapaRegistro]] = {}
+    for row in rows_previas:
+        by_cod.setdefault(row.codigo_etapa, []).append(row)
+
+    incompletos = [
+        prev_cod
+        for prev_cod in prev_cods
+        if not _codigo_satisfecho_para_backfill(
+            ETAPAS_CATALOGO[prev_cod],
+            by_cod.get(prev_cod, []),
+            areas_usuarias,
+        )
+    ]
+    if not incompletos:
+        return
+
+    first_incomplete_idx = CADENA.index(incompletos[0])
+    if target_idx - first_incomplete_idx < _AUTOCOMPLETAR_SALTO_MINIMO:
+        return
+
+    for prev_cod in incompletos:
+        spec = ETAPAS_CATALOGO[prev_cod]
+        rows = _preferir_filas_activas(by_cod.get(prev_cod, []))
+
+        if spec.por_area:
+            areas_objetivo = areas_usuarias or [
+                r.area_usuaria for r in rows if r.area_usuaria
+            ] or [None]
+            rows_por_area = {r.area_usuaria: r for r in rows if r.area_usuaria}
+            for area in areas_objetivo:
+                existing = rows_por_area.get(area)
+                if existing is not None:
+                    _actualizar_fila_sin_evidencia(
+                        existing,
+                        fecha_referencia,
+                        current_user_username,
+                    )
+                else:
+                    db.add(
+                        _crear_fila_sin_evidencia(
+                            proceso_id,
+                            prev_cod,
+                            spec,
+                            area,
+                            fecha_referencia,
+                            current_user_username,
+                        )
+                    )
+            continue
+
+        if rows:
+            for row in rows:
+                _actualizar_fila_sin_evidencia(
+                    row,
+                    fecha_referencia,
+                    current_user_username,
+                )
+        else:
+            db.add(
+                _crear_fila_sin_evidencia(
+                    proceso_id,
+                    prev_cod,
+                    spec,
+                    None,
+                    fecha_referencia,
+                    current_user_username,
+                )
+            )
+
+    db.flush()
+
 def registrar_etapa(
     db: Session,
     proceso_id: int,
@@ -148,6 +337,15 @@ def registrar_etapa(
     validar_proceso_activo(db, proceso_id)
 
     cod = payload.codigo_etapa
+    fecha_referencia = payload.fecha_inicio or payload.fecha_fin or date.today()
+    if payload.estado_etapa in ("COMPLETADO", "EN_CURSO"):
+        _autocompletar_previas_sin_evidencia(
+            db,
+            proceso_id,
+            cod,
+            fecha_referencia,
+            current_user_username,
+        )
 
     # --- NO_APLICA fast-path: skip prereqs and all stage-specific rules ---
     # A stage marked NO_APLICA is intentionally skipped (e.g. direct service order
@@ -665,7 +863,7 @@ def calcular_progreso(etapas_rows: list[EtapaRegistro]) -> ProgresoOut:
 
         estado = _estado_consolidado(spec, rows_for_cod)
 
-        if estado == "COMPLETADO":
+        if estado in _ESTADOS_COMPLETAN_AVANCE:
             # Only count non-bucle cods in progress numerator
             if not spec.es_bucle:
                 completadas += 1
@@ -716,14 +914,18 @@ def _estado_consolidado(spec, rows: list[EtapaRegistro]) -> str:
         return last.estado_etapa
 
     if spec.por_area:
-        # ALL rows must be COMPLETADO or NO_APLICA
-        _done = {"COMPLETADO", "NO_APLICA"}
-        if all(r.estado_etapa in _done for r in rows):
-            # Distinguish: all NO_APLICA → return NO_APLICA; mixed/all COMPLETADO → COMPLETADO
+        # ALL rows must be COMPLETADO, SIN_EVIDENCIA or NO_APLICA
+        if all(r.estado_etapa in _ESTADOS_SATISFACEN for r in rows):
+            # Distinguish: all NO_APLICA -> denominator exclusion.
             if all(r.estado_etapa == "NO_APLICA" for r in rows):
                 return "NO_APLICA"
+            if any(r.estado_etapa == "SIN_EVIDENCIA" for r in rows):
+                return "SIN_EVIDENCIA"
             return "COMPLETADO"
-        if any(r.estado_etapa in ("EN_CURSO", "COMPLETADO") for r in rows):
+        if any(
+            r.estado_etapa in ("EN_CURSO", "COMPLETADO", "SIN_EVIDENCIA")
+            for r in rows
+        ):
             return "EN_CURSO"
         return "PENDIENTE"
 
